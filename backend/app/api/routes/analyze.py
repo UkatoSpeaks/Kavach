@@ -10,13 +10,18 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_http_client, get_session, get_session_factory
+from app.api.deps import (
+    get_http_client,
+    get_pattern_search,
+    get_session,
+    get_session_factory,
+)
 from app.core.config import Settings, get_settings
 from app.core.enums import InputType
 from app.db.models import Analysis
 from app.db.session import SessionFactory
 from app.schemas.analysis import AnalysisResult
-from app.services import qr
+from app.services import qr, rag, reputation
 from app.services.cache import LookupCache
 from app.services.extractors import extract_upi_ids, extract_urls, parse_upi_uri
 from app.services.pipeline import Checks, PipelineOutput, analyze
@@ -36,9 +41,11 @@ async def get_checks(
     settings: SettingsDep,
     client: Annotated[httpx.AsyncClient, Depends(get_http_client)],
     session_factory: Annotated[SessionFactory | None, Depends(get_session_factory)],
+    patterns: Annotated[rag.PatternSearch | None, Depends(get_pattern_search)],
 ) -> Checks:
     cache = LookupCache(session_factory, timedelta(hours=settings.URL_CACHE_TTL_HOURS))
-    return Checks(client=client, cache=cache, session_factory=session_factory)
+    find = reputation.find_reported_in(session_factory) if session_factory else None
+    return Checks(client=client, cache=cache, find_reported=find, patterns=patterns)
 
 
 ChecksDep = Annotated[Checks, Depends(get_checks)]

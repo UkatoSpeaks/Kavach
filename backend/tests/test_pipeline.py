@@ -17,6 +17,7 @@ from app.services.pipeline import Checks, analyze, analyze_text
 from app.services.scoring import SignalOutcome, Thresholds, combine_signals, score
 from app.services.url_intel import SAFE_BROWSING_URL
 from tests.examples import GENUINE_EXAMPLES, SCAM_EXAMPLES
+from tests.fakes import fake_pattern_search
 from tests.test_scoring import WEIGHTS, rule_result
 
 
@@ -47,8 +48,14 @@ async def checks(request: pytest.FixtureRequest) -> AsyncIterator[Checks]:
     with respx.mock(assert_all_called=False) as router:
         SCENARIOS[request.param](router)
         async with httpx.AsyncClient() as client:
-            # No database: reputation reports "unavailable", the cache lives in memory.
-            yield Checks(client, LookupCache(None, timedelta(hours=24)), session_factory=None)
+            # No database: reputation reports "unavailable", the cache lives in memory, and
+            # pattern retrieval runs in memory over the real docs with a fake embedder.
+            yield Checks(
+                client,
+                LookupCache(None, timedelta(hours=24)),
+                find_reported=None,
+                patterns=fake_pattern_search(),
+            )
 
 
 SETTINGS = get_settings().model_copy(update={"SAFE_BROWSING_API_KEY": "test-key"})

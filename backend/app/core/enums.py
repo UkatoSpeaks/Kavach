@@ -40,3 +40,10 @@ class ScamType(StrEnum):
     TASK_JOB = "task_job"
     FAKE_CUSTOMER_CARE = "fake_customer_care"
     GENERIC = "generic"
+
+
+class PatternKind(StrEnum):
+    """Knowledge-base docs: scam patterns, and genuine messages people mistake for scams."""
+
+    SCAM = "scam"
+    GENUINE = "genuine"

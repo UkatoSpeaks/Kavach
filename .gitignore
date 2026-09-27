@@ -19,3 +19,6 @@ backend/data/datasets/raw/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local model caches (fastembed downloads)
+backend/.cache/

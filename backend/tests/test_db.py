@@ -2,6 +2,7 @@
 
 import uuid
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -9,6 +10,8 @@ from app.core.enums import EntityType, InputType, Verdict
 from app.db.models import Analysis
 from app.schemas.analysis import AnalysisResult, RedFlag, Signal
 from app.services.reputation import upsert_reported_entity
+
+pytestmark = pytest.mark.db
 
 
 async def test_insert_and_read_analysis(db_session: AsyncSession) -> None:

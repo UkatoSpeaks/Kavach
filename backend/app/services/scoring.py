@@ -13,13 +13,17 @@ A signal is listed in the breakdown but left out of the mean when it
 Some evidence is decisive on its own (a Google Safe Browsing match, a verified scam UPI ID):
 averaging it with a quiet rules layer would call a known phishing link safe. Such a signal
 sets `floor`, the minimum final score its evidence justifies.
+
+The opposite also exists: weak, supporting evidence (similarity to known scam patterns) sets
+`can_decide_scam=False`. It may nudge the score, but if the result is only a scam because of
+such signals, the score is capped just below the scam threshold.
 """
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from app.core.enums import ScamType, Severity, Verdict
-from app.schemas.analysis import RedFlag, Signal
+from app.schemas.analysis import RedFlag, Signal, SimilarPattern
 from app.services.rules import RuleResult
 
 
@@ -32,6 +36,8 @@ class SignalOutcome:
     floor: int | None = None  # minimum final score this evidence justifies
     red_flags: tuple[RedFlag, ...] = ()
     scam_type: ScamType | None = None  # the layer's guess, used if the rules have none
+    similar_patterns: tuple[SimilarPattern, ...] = ()
+    can_decide_scam: bool = True  # False: must not make a result "scam" on its own
 
 
 @dataclass(frozen=True)
@@ -48,6 +54,7 @@ class ScoreResult:
     signal_breakdown: list[Signal]
     strong_rule_floor_applied: bool = False
     floor_source: str | None = None  # signal whose evidence floor set the score
+    scam_capped: bool = False  # only supporting signals made it a scam, so it was capped
 
 
 def severity_for(weight: float) -> Severity:
@@ -117,20 +124,25 @@ def score(
     """Final score from the rules signal plus any other layers' outcomes."""
     outcomes = [rules_signal(rule_result, rules_informative_if_empty), *extra]
     risk_score, breakdown = combine_signals(outcomes, weights)
-
-    # Decisive evidence from one layer (see module docstring) lifts the score.
+    risk_score, top = _apply_floor(risk_score, extra)
     floor_source = None
-    floors = [o for o in extra if o.floor is not None and o.score is not None]
-    top = max(floors, key=lambda o: o.floor or 0, default=None)
-    if top is not None and top.floor is not None and risk_score < top.floor:
-        risk_score, floor_source = top.floor, top.source
-        breakdown = [
-            s.model_copy(update={"detail": f"{s.detail}; sets the minimum score to {top.floor}"})
-            if s.source == top.source
-            else s
-            for s in breakdown
-        ]
+    if top is not None:
+        floor_source = top.source
+        breakdown = _note(breakdown, top.source, f"sets the minimum score to {top.floor}")
     verdict = verdict_for(risk_score, thresholds)
+
+    # Supporting-only signals (can_decide_scam=False) must not tip a result into "scam".
+    scam_capped = False
+    if verdict is Verdict.SCAM:
+        deciding = [o for o in outcomes if o.can_decide_scam]
+        supporting = {o.source for o in outcomes if not o.can_decide_scam}
+        base, _ = combine_signals(deciding, weights)
+        base, _ = _apply_floor(base, [o for o in extra if o.can_decide_scam])
+        if supporting and verdict_for(base, thresholds) is not Verdict.SCAM:
+            risk_score, scam_capped = thresholds.scam_min - 1, True
+            verdict = verdict_for(risk_score, thresholds)
+            for source in supporting:
+                breakdown = _note(breakdown, source, "capped: cannot make a result a scam alone")
 
     # One very strong rule (e.g. "enter PIN to receive money") must never end up "safe",
     # even if other signals average it down. Lift the score too so it matches the verdict.
@@ -138,4 +150,22 @@ def score(
     if verdict is Verdict.SAFE and rule_result.max_weight >= thresholds.strong_rule_weight:
         risk_score, verdict, floor_applied = thresholds.suspicious_min, Verdict.SUSPICIOUS, True
 
-    return ScoreResult(risk_score, verdict, breakdown, floor_applied, floor_source)
+    return ScoreResult(risk_score, verdict, breakdown, floor_applied, floor_source, scam_capped)
+
+
+def _apply_floor(
+    risk_score: int, outcomes: Sequence[SignalOutcome]
+) -> tuple[int, SignalOutcome | None]:
+    """Decisive evidence from one layer (see module docstring) lifts the score."""
+    floors = [o for o in outcomes if o.floor is not None and o.score is not None]
+    top = max(floors, key=lambda o: o.floor or 0, default=None)
+    if top is not None and top.floor is not None and risk_score < top.floor:
+        return top.floor, top
+    return risk_score, None
+
+
+def _note(breakdown: list[Signal], source: str, note: str) -> list[Signal]:
+    return [
+        s.model_copy(update={"detail": f"{s.detail}; {note}"}) if s.source == source else s
+        for s in breakdown
+    ]

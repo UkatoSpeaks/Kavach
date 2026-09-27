@@ -217,15 +217,19 @@ async def test_clean_old_domain_does_not_dilute_rules(make_client: ClientFactory
         body = (await client.post("/analyze/text", json={"text": text})).json()
     intel = signal(body, "url_intel")
     assert intel["weight"] == 0 and "no issues found" in intel["detail"]
-    assert body["risk_score"] == signal(body, "rules")["score"]
+    # The score is the mean of the other signals alone: url_intel is not in it.
+    counted = [s for s in body["signal_breakdown"] if s["weight"] > 0]
+    assert "url_intel" not in {s["source"] for s in counted}
+    assert body["risk_score"] == round(sum(s["score"] * s["weight"] for s in counted))
 
 
+@pytest.mark.db
 @respx.mock
 async def test_lookups_are_cached_in_url_cache(
-    make_client: ClientFactory, db_session: AsyncSession
+    make_db_client: ClientFactory, db_session: AsyncSession
 ) -> None:
     rdap = respx.get(RDAP.format("sbi-kyc-update.xyz")).mock(return_value=rdap_registered(5))
-    async with make_client() as client:
+    async with make_db_client() as client:
         for _ in range(2):
             resp = await client.post("/analyze/url", json={"url": "https://sbi-kyc-update.xyz/"})
             assert resp.json()["verdict"] == "scam"
@@ -235,9 +239,10 @@ async def test_lookups_are_cached_in_url_cache(
     assert row is not None and row.result["registered"] is not None
 
 
+@pytest.mark.db
 @respx.mock
 async def test_stale_cache_entry_is_refreshed(
-    make_client: ClientFactory, db_session: AsyncSession
+    make_db_client: ClientFactory, db_session: AsyncSession
 ) -> None:
     db_session.add(
         UrlCache(
@@ -248,7 +253,7 @@ async def test_stale_cache_entry_is_refreshed(
     )
     await db_session.flush()
     rdap = respx.get(RDAP.format("sbi-kyc-update.xyz")).mock(return_value=rdap_registered(5))
-    async with make_client() as client:
+    async with make_db_client() as client:
         body = (
             await client.post("/analyze/url", json={"url": "https://sbi-kyc-update.xyz/"})
         ).json()
@@ -308,6 +313,66 @@ async def test_expand_never_contacts_private_hosts(target: str) -> None:
         chain = await expand(client, "https://bit.ly/ssrf")
     assert chain == ["https://bit.ly/ssrf", target]
     assert respx.calls.call_count == 1
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "addresses",
+    [["127.0.0.1"], ["10.1.2.3"], ["::1"], ["93.184.215.14", "192.168.0.5"],
+     ["::ffff:127.0.0.1"], ["169.254.169.254"], ["fe80::1"], ["224.0.0.1"], []],
+    ids=["loopback-v4", "private-10", "loopback-v6", "one-of-many-private",
+         "v4-mapped-v6-loopback", "link-local-metadata", "link-local-v6", "multicast",
+         "does-not-resolve"],
+)  # fmt: skip
+async def test_expand_refuses_hosts_resolving_to_private_addresses(
+    fake_dns: dict[str, list[str]], addresses: list[str]
+) -> None:
+    # A public-looking name the static check lets through; only DNS reveals the target.
+    fake_dns["innocent-looking.com"] = addresses
+    respx.head("https://bit.ly/rebind").mock(
+        return_value=httpx.Response(302, headers={"Location": "https://innocent-looking.com/x"})
+    )
+    target = respx.head("https://innocent-looking.com/x").mock(return_value=httpx.Response(200))
+    async with httpx.AsyncClient() as client:
+        chain = await expand(client, "https://bit.ly/rebind")
+    assert chain == ["https://bit.ly/rebind", "https://innocent-looking.com/x"]
+    assert not target.called
+
+
+@respx.mock
+async def test_expand_checks_the_first_hop_too(fake_dns: dict[str, list[str]]) -> None:
+    fake_dns["bit.ly"] = ["127.0.0.1"]
+    respx.route().mock(return_value=httpx.Response(200))
+    async with httpx.AsyncClient() as client:
+        assert await expand(client, "https://bit.ly/x") == ["https://bit.ly/x"]
+    assert respx.calls.call_count == 0
+
+
+@respx.mock
+async def test_expand_follows_hosts_resolving_to_public_addresses(
+    fake_dns: dict[str, list[str]],
+) -> None:
+    fake_dns["example.com"] = ["93.184.215.14", "2606:2800:21f:cb07:6820:80da:af6b:8b2c"]
+    respx.head("https://bit.ly/ok").mock(
+        return_value=httpx.Response(301, headers={"Location": "https://example.com/"})
+    )
+    final = respx.head("https://example.com/").mock(return_value=httpx.Response(200))
+    async with httpx.AsyncClient() as client:
+        chain = await expand(client, "https://bit.ly/ok")
+    assert chain == ["https://bit.ly/ok", "https://example.com/"]
+    assert final.called
+
+
+async def test_slow_dns_is_cut_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def hang(host: str) -> list:
+        await asyncio.sleep(5)
+        return []
+
+    monkeypatch.setattr(url_intel, "_getaddrinfo", hang)
+    monkeypatch.setattr(url_intel, "DNS_TIMEOUT_S", 0.05)
+    with respx.mock:
+        async with httpx.AsyncClient() as client:
+            assert await expand(client, "https://bit.ly/x") == ["https://bit.ly/x"]
 
 
 # ----------------------------------------------------------------------------- pure helpers

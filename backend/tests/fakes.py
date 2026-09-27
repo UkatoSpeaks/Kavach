@@ -1,0 +1,123 @@
+"""In-memory stand-ins for the database, so API tests that only exercise the pipeline and
+routes don't round-trip to Supabase. Real persistence is covered by the @pytest.mark.db tests.
+"""
+
+import hashlib
+import re
+import uuid
+from collections.abc import Sequence
+from datetime import UTC, datetime
+from functools import lru_cache
+from typing import Any
+
+from app.core.enums import EntityType
+from app.db.models import ReportedEntity
+from app.services import rag
+from app.services.embeddings import EmbeddingUnavailable, unit
+from app.services.knowledge_base import PatternDoc, load_docs
+from app.services.reputation import normalize
+from scripts.seed_reported import DEMO_ENTITIES
+
+
+class FakeSession:
+    """The part of AsyncSession the analyze routes use: add, commit, rollback, get.
+
+    commit() fills in what the database would (id, created_at) and keeps the rows in memory.
+    Anything else (e.g. execute) raises AttributeError, so a test that really needs SQL
+    fails loudly instead of passing against the fake.
+    """
+
+    def __init__(self) -> None:
+        self.rows: dict[tuple[type, uuid.UUID], Any] = {}
+        self._pending: list[Any] = []
+
+    def add(self, obj: Any) -> None:
+        self._pending.append(obj)
+
+    async def commit(self) -> None:
+        for obj in self._pending:
+            if obj.id is None:
+                obj.id = uuid.uuid4()
+            if hasattr(obj, "created_at") and obj.created_at is None:
+                obj.created_at = datetime.now(UTC)
+            self.rows[(type(obj), obj.id)] = obj
+        self._pending.clear()
+
+    async def rollback(self) -> None:
+        self._pending.clear()
+
+    async def get(self, model: type, key: uuid.UUID) -> Any:
+        return self.rows.get((model, key))
+
+    def all(self, model: type) -> list[Any]:
+        return [row for (m, _), row in self.rows.items() if m is model]
+
+
+class InMemoryReputation:
+    """A reputation.FindReported backed by a dict instead of reported_entities."""
+
+    def __init__(self) -> None:
+        self.entities: dict[tuple[str, str], ReportedEntity] = {}
+
+    def add(self, entity_type: EntityType, value: str, count: int, verified: bool) -> None:
+        value = normalize(entity_type, value)
+        self.entities[(entity_type.value, value)] = ReportedEntity(
+            id=uuid.uuid4(),
+            entity_type=entity_type.value,
+            value=value,
+            report_count=count,
+            is_verified_scam=verified,
+        )
+
+    def seed_demo(self) -> None:
+        """The same rows scripts/seed_reported.py writes."""
+        for entity_type, value, count, verified, _ in DEMO_ENTITIES:
+            self.add(entity_type, value, count, verified)
+
+    async def __call__(self, keys: Sequence[tuple[EntityType, str]]) -> list[ReportedEntity]:
+        return [self.entities[(t.value, v)] for t, v in keys if (t.value, v) in self.entities]
+
+
+class FakeEmbedder:
+    """Deterministic, instant stand-in for the embedding model: a hashed bag of words, so
+    texts that share words are similar. Good enough to exercise retrieval and the signal."""
+
+    model_name = "fake-hashed-bag-of-words"
+
+    def __init__(self, dim: int = 384) -> None:
+        self.dim = dim
+        self.calls = 0
+
+    def vector(self, text: str) -> list[float]:
+        vec = [0.0] * self.dim
+        for token in re.findall(r"\w+", text.lower()):
+            digest = hashlib.blake2b(token.encode(), digest_size=8).digest()
+            vec[int.from_bytes(digest, "big") % self.dim] += 1.0
+        return unit(vec)
+
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        self.calls += 1
+        return [self.vector(t) for t in texts]
+
+
+class UnavailableEmbedder:
+    """An embedder whose model never loaded."""
+
+    model_name = "unavailable"
+
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        raise EmbeddingUnavailable("model is still loading")
+
+
+@lru_cache
+def _kb_docs() -> tuple[PatternDoc, ...]:
+    return tuple(load_docs())
+
+
+def fake_pattern_search(docs: Sequence[PatternDoc] | None = None) -> rag.PatternSearch:
+    """Pattern search over the real knowledge-base docs (or `docs`), embedded with
+    FakeEmbedder and retrieved in memory."""
+    embedder = FakeEmbedder()
+    docs = _kb_docs() if docs is None else docs
+    retriever = rag.InMemoryRetriever([(d, embedder.vector(d.embed_text)) for d in docs])
+    return rag.PatternSearch(embedder, retriever)

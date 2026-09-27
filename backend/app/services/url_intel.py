@@ -4,8 +4,9 @@ For every URL in the input:
 1. Official domains (allowlist below, or registry-restricted suffixes like .gov.in/.bank.in)
    are low risk immediately, with no network calls.
 2. Shortened links are expanded by following redirects (HEAD, falling back to a streamed
-   GET whose body is never read), at most MAX_HOPS hops. Only public http(s) hosts are
-   contacted, so a shortener can't point us at localhost or a private network.
+   GET whose body is never read), at most MAX_HOPS hops. Before each hop the hostname is
+   resolved, and it is only contacted if every address it resolves to is public, so a
+   shortener can't point us at localhost or a private network (directly or via DNS).
 3. The final domain gets the lookalike / cheap-TLD checks from the rules engine, a domain
    age lookup via RDAP and, if SAFE_BROWSING_API_KEY is set, a Google Safe Browsing lookup.
 
@@ -18,6 +19,7 @@ import asyncio
 import ipaddress
 import logging
 import math
+import socket
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
@@ -68,6 +70,7 @@ ESTABLISHED_DOMAIN_DAYS = 365
 RDAP_URL = "https://rdap.org/domain/{domain}"
 SAFE_BROWSING_URL = "https://safebrowsing.googleapis.com/v4/threatMatches:find"
 _EVIDENCE_MAX = 200
+DNS_TIMEOUT_S = 2
 
 # Final-score floors for evidence that is decisive on its own (see scoring.py).
 SAFE_BROWSING_FLOOR = 90
@@ -117,8 +120,22 @@ def _parse(url: str) -> ExtractedURL | None:
     return next(iter(extract_urls(url)), None)
 
 
+def is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped  # ::ffff:127.0.0.1 is 127.0.0.1
+    return ip.is_global and not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
 def _is_public_http(url: str) -> bool:
-    """True if `url` is http(s) on a public host. Blocks SSRF via redirects."""
+    """True if `url` is http(s) on a host that isn't private by its name alone. Static
+    check only: _resolves_to_public also checks what a hostname resolves to."""
     parts = urlsplit(url)
     host = (parts.hostname or "").lower()
     if parts.scheme not in ("http", "https") or not host:
@@ -126,7 +143,7 @@ def _is_public_http(url: str) -> bool:
     if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
         return False
     try:
-        return ipaddress.ip_address(host).is_global
+        return is_public_ip(ipaddress.ip_address(host))
     except ValueError:
         return True  # a hostname
 
@@ -157,6 +174,30 @@ async def _cached(
 # --------------------------------------------------------------------------- lookups
 
 
+async def _getaddrinfo(host: str) -> list[tuple[Any, ...]]:
+    return await asyncio.get_running_loop().getaddrinfo(host, None, type=socket.SOCK_STREAM)
+
+
+async def _resolves_to_public(host: str) -> bool:
+    """True only if `host` resolves and every address it resolves to (IPv4 and IPv6) is
+    public. One private answer is enough to refuse: the client could connect to any of them.
+    """
+    try:
+        async with asyncio.timeout(DNS_TIMEOUT_S):
+            infos = await _getaddrinfo(host)
+    except (OSError, TimeoutError) as exc:  # socket.gaierror is an OSError
+        logger.info("not following %s: DNS lookup failed: %s", host, _reason(exc))
+        return False
+    addresses = {info[4][0].split("%", 1)[0] for info in infos}  # drop IPv6 scope ids
+    try:
+        public = bool(addresses) and all(is_public_ip(ipaddress.ip_address(a)) for a in addresses)
+    except ValueError:
+        public = False
+    if not public:
+        logger.warning("not following %s: resolves to %s", host, sorted(addresses))
+    return public
+
+
 async def _probe(client: httpx.AsyncClient, url: str) -> tuple[int, str | None]:
     """(status, Location header) without downloading the body."""
     try:
@@ -177,6 +218,8 @@ async def expand(client: httpx.AsyncClient, url: str, max_hops: int = MAX_HOPS) 
     for _ in range(max_hops):
         current = chain[-1]
         if not _is_public_http(current):
+            break
+        if not await _resolves_to_public(urlsplit(current).hostname or ""):
             break
         status, location = await _probe(client, current)
         if status not in REDIRECT_STATUSES or not location:

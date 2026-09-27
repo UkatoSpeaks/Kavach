@@ -1,6 +1,6 @@
 import pytest
 
-from app.core.config import _normalize_database_url
+from app.core.config import BACKEND_DIR, Settings, _normalize_database_url
 
 
 @pytest.mark.parametrize(
@@ -32,3 +32,8 @@ from app.core.config import _normalize_database_url
 )
 def test_normalize_database_url(raw: str, expected: str) -> None:
     assert _normalize_database_url(raw) == expected
+
+
+def test_relative_embedding_cache_dir_is_under_backend() -> None:
+    settings = Settings(DATABASE_URL="postgresql://u:p@h/db", EMBEDDING_CACHE_DIR="models/fe")
+    assert settings.EMBEDDING_CACHE_DIR == BACKEND_DIR / "models" / "fe"

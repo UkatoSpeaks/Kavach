@@ -45,8 +45,23 @@ class Settings(BaseSettings):
     GROQ_MODEL: str = "llama-3.3-70b-versatile"
     ENV: Literal["dev", "test", "prod"] = "dev"
     LOG_LEVEL: str = "INFO"
-    # Must match the embedding model's output size. Changing it needs a migration.
+    # Local embedding model (fastembed/ONNX) for scam-pattern retrieval. Must be multilingual
+    # and output EMBEDDING_DIM dims; changing the dim needs a migration, changing the model
+    # needs a re-run of scripts/ingest_patterns.py.
+    EMBEDDING_MODEL: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     EMBEDDING_DIM: int = 384
+    # Where the model files are downloaded (~220 MB). Gitignored.
+    EMBEDDING_CACHE_DIR: Path = BACKEND_DIR / ".cache" / "fastembed"
+
+    # Pattern retrieval (see app/services/rag.py). The signal is driven by the margin
+    # between the closest scam pattern and the closest genuine-message pattern.
+    PATTERN_TOP_K: int = 3
+    # Margins below this are uninformative (no closer to a scam than to a genuine message).
+    PATTERN_MIN_MARGIN: float = 0.05
+    # Margin at which the signal reaches its maximum score.
+    PATTERN_FULL_MARGIN: float = 0.20
+    # Scam patterns less similar than this are not listed in similar_patterns.
+    PATTERN_MIN_SIMILARITY: float = 0.35
 
     # Real-world checks. Safe Browsing is skipped when no key is set.
     SAFE_BROWSING_API_KEY: str = ""
@@ -81,6 +96,17 @@ class Settings(BaseSettings):
         if not 0 < self.VERDICT_SUSPICIOUS_MIN < self.VERDICT_SCAM_MIN <= 100:
             raise ValueError("need 0 < VERDICT_SUSPICIOUS_MIN < VERDICT_SCAM_MIN <= 100")
         return self
+
+    @model_validator(mode="after")
+    def _pattern_margins_ordered(self) -> "Settings":
+        if not 0 <= self.PATTERN_MIN_MARGIN < self.PATTERN_FULL_MARGIN <= 1:
+            raise ValueError("need 0 <= PATTERN_MIN_MARGIN < PATTERN_FULL_MARGIN <= 1")
+        return self
+
+    @field_validator("EMBEDDING_CACHE_DIR")
+    @classmethod
+    def _relative_to_backend(cls, v: Path) -> Path:
+        return v if v.is_absolute() else BACKEND_DIR / v
 
     @field_validator("LOG_LEVEL")
     @classmethod

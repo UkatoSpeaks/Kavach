@@ -34,6 +34,7 @@ class SimilarPattern(BaseModel):
 
     slug: str
     title: str
+    category: str | None = Field(default=None, description="The v1 scam type it illustrates.")
     similarity: float = Field(ge=0, le=1, description="Cosine similarity to the input.")
     source_url: str | None = None
 

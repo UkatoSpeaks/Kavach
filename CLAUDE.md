@@ -72,3 +72,8 @@ backend/
   - test: `pytest -q`
   - lint: `ruff check . && ruff format --check .`
   - migrate: `alembic upgrade head`
+
+## Scope (v1): UPI and link fraud only
+
+Focus on: (1) "receive money" UPI / collect-request scams, (2) QR code scams, (3) "sent by mistake" refund scams, (4) phishing links (fake KYC/account block, electricity bill, e-challan, parcel/customs), (5) task-based job scams, (6) fake customer care numbers.
+Out of scope for now (later versions): OTP/Aadhaar fraud, SIM swap, digital arrest, loan apps, investment scams, deepfakes, voice calls. Don't build features for these yet.

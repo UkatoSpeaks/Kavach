@@ -1,8 +1,8 @@
 """The analysis pipeline: extract -> rules + real-world checks -> scoring -> explanation.
 
 `analyze_text` is the pure, synchronous core (extractors, rules, UPI checks, scoring).
-`analyze` adds the network signals (url_intel, reputation), run concurrently with
-asyncio.gather. Every network signal has a timeout and fails soft: it shows up as
+`analyze` adds the network signals (url_intel, reputation, pattern_similarity), run
+concurrently with asyncio.gather. Every network signal has a timeout and fails soft: it shows up as
 "unavailable" in the breakdown and the rest of the analysis still returns.
 """
 
@@ -16,10 +16,9 @@ import httpx
 
 from app.core.config import Settings
 from app.core.enums import EntityType, ScamType, Verdict
-from app.db.session import SessionFactory
 from app.schemas.analysis import AnalysisResult, RedFlag
 from app.schemas.entities import ExtractedEntities
-from app.services import explain, reputation, rules, scoring, upi, url_intel
+from app.services import explain, rag, reputation, rules, scoring, upi, url_intel
 from app.services.cache import LookupCache
 from app.services.extractors import extract_entities
 from app.services.scoring import SignalOutcome, severity_for
@@ -40,7 +39,8 @@ class Checks:
 
     client: httpx.AsyncClient
     cache: LookupCache
-    session_factory: SessionFactory | None  # None: reputation is reported unavailable
+    find_reported: reputation.FindReported | None  # None: reputation is reported unavailable
+    patterns: rag.PatternSearch | None = None  # None: pattern_similarity is reported unavailable
 
 
 def thresholds_from(settings: Settings) -> scoring.Thresholds:
@@ -123,6 +123,12 @@ def _finish(
     )
     timer.lap("explain", t)
 
+    # Knowledge-base matches explain a warning; on a safe verdict they would only alarm.
+    similar = (
+        [p for o in outcomes for p in o.similar_patterns]
+        if scored.verdict is not Verdict.SAFE
+        else []
+    )
     result = AnalysisResult(
         risk_score=scored.risk_score,
         verdict=scored.verdict,
@@ -132,6 +138,7 @@ def _finish(
         explanation_en=explanation_en,
         explanation_hi=explanation_hi,
         advice=advice,
+        similar_patterns=similar,
     )
     return PipelineOutput(result=result, entities=entities, latency_ms=timer.latency)
 
@@ -172,11 +179,16 @@ async def _timed(
 
 
 async def _reputation(keys: list[tuple[EntityType, str]], checks: Checks) -> SignalOutcome | None:
-    if checks.session_factory is None:
+    if checks.find_reported is None:
         return SignalOutcome("reputation", None, "database not configured")
-    async with checks.session_factory() as session:
-        found = await reputation.find_reported(session, keys)
+    found = await checks.find_reported(keys)
     return reputation.reputation_signal(keys, found)
+
+
+async def _patterns(text: str, checks: Checks) -> SignalOutcome:
+    if checks.patterns is None:
+        return SignalOutcome(rag.SOURCE, None, "embedding model not configured")
+    return await rag.pattern_similarity(text, checks.patterns)
 
 
 async def analyze(
@@ -211,6 +223,9 @@ async def analyze(
         keys = reputation.entity_keys(entities)
         if keys:
             jobs.append(_timed("reputation", lambda: _reputation(keys, checks), timer, timeout))
+        # Bare URLs/UPI IDs/QR payloads have no wording to compare with the knowledge base.
+        if message_text:
+            jobs.append(_timed(rag.SOURCE, lambda: _patterns(text, checks), timer, timeout))
 
     outcomes = [o for o in await asyncio.gather(*jobs) if o is not None]
     return _finish(entities, rule_result, outcomes, settings, language_hint, message_text, timer)

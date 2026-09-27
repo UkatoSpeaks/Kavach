@@ -1,4 +1,5 @@
-"""API tests. Database writes go through the rolled-back db_session fixture."""
+"""API tests. Analyses are saved to an in-memory FakeSession; one @pytest.mark.db test
+covers the real save and read-back."""
 
 import uuid
 from collections.abc import AsyncIterator
@@ -13,6 +14,7 @@ from app.api.deps import get_session
 from app.db.models import Analysis
 from app.main import create_app
 from tests.examples import GENUINE_EXAMPLES, SCAM_EXAMPLES
+from tests.fakes import FakeSession
 
 
 def _client_with(session: object) -> httpx.AsyncClient:
@@ -26,13 +28,13 @@ def _client_with(session: object) -> httpx.AsyncClient:
 
 
 @pytest.fixture
-async def client(db_session: AsyncSession) -> AsyncIterator[httpx.AsyncClient]:
-    async with _client_with(db_session) as c:
+async def client(fake_session: FakeSession) -> AsyncIterator[httpx.AsyncClient]:
+    async with _client_with(fake_session) as c:
         yield c
 
 
 async def test_analyze_scam_saves_and_reads_back(
-    client: httpx.AsyncClient, db_session: AsyncSession
+    client: httpx.AsyncClient, fake_session: FakeSession
 ) -> None:
     text = SCAM_EXAMPLES[0][1]
     resp = await client.post("/analyze/text", json={"text": text})
@@ -44,15 +46,27 @@ async def test_analyze_scam_saves_and_reads_back(
     assert body["red_flags"] and body["signal_breakdown"][0]["source"] == "rules"
     assert body["created_at"] is not None
 
-    row = (
-        await db_session.execute(select(Analysis).where(Analysis.id == uuid.UUID(body["id"])))
-    ).scalar_one()
+    [row] = fake_session.all(Analysis)
+    assert str(row.id) == body["id"]
     assert row.raw_input == text
     assert row.input_type == "text"
-    assert set(row.latency_ms) == {"extract", "rules", "scoring", "explain"}
+    assert set(row.latency_ms) == {"extract", "rules", "pattern_similarity", "scoring", "explain"}
     assert row.extracted_entities["sensitive_info"] == ["upi_pin"]
 
     got = await client.get(f"/analysis/{body['id']}")
+    assert got.status_code == 200
+    assert got.json() == body
+
+
+@pytest.mark.db
+async def test_saved_analysis_round_trips_through_db(db_session: AsyncSession) -> None:
+    async with _client_with(db_session) as client:
+        body = (await client.post("/analyze/text", json={"text": SCAM_EXAMPLES[0][1]})).json()
+        got = await client.get(f"/analysis/{body['id']}")
+    row = (
+        await db_session.execute(select(Analysis).where(Analysis.id == uuid.UUID(body["id"])))
+    ).scalar_one()
+    assert row.created_at is not None and row.extracted_entities["sensitive_info"] == ["upi_pin"]
     assert got.status_code == 200
     assert got.json() == body
 

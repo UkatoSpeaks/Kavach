@@ -2,7 +2,7 @@ import uuid
 
 import pytest
 import respx
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.enums import EntityType
@@ -17,6 +17,7 @@ from app.services.reputation import (
 )
 from scripts.seed_reported import DEMO_ENTITIES, seed
 from tests.conftest import ClientFactory
+from tests.fakes import FakeSession, InMemoryReputation
 
 U, P, D, L = EntityType.UPI, EntityType.PHONE, EntityType.DOMAIN, EntityType.URL
 
@@ -85,6 +86,7 @@ def test_no_reports_is_not_informative() -> None:
 # ----------------------------------------------------------------------------- DB + API
 
 
+@pytest.mark.db
 async def test_seed_is_idempotent(db_session: AsyncSession) -> None:
     await seed(db_session)
     await seed(db_session)
@@ -99,12 +101,12 @@ async def test_seed_is_idempotent(db_session: AsyncSession) -> None:
 
 
 async def test_seeded_upi_id_raises_the_score(
-    make_client: ClientFactory, db_session: AsyncSession
+    make_client: ClientFactory, reputation_store: InMemoryReputation
 ) -> None:
     # Same message shape; one UPI ID is seeded (3 reports), the other never reported.
     text = "Please send the ₹499 KYC processing fee to {} today."
     unreported = f"x{uuid.uuid4().hex[:8]}-cashback-win@ibl"
-    await seed(db_session)
+    reputation_store.seed_demo()
     async with make_client() as client:
         before = await client.post("/analyze/text", json={"text": text.format(unreported)})
         after = await client.post(
@@ -122,9 +124,9 @@ async def test_seeded_upi_id_raises_the_score(
 
 
 async def test_verified_scam_domain_is_decisive(
-    make_client: ClientFactory, db_session: AsyncSession
+    make_client: ClientFactory, reputation_store: InMemoryReputation
 ) -> None:
-    await seed(db_session)
+    reputation_store.seed_demo()
     async with make_client() as client:
         # A subdomain of a verified-scam domain; RDAP is not mocked, so url_intel fails soft.
         with respx.mock:
@@ -135,11 +137,12 @@ async def test_verified_scam_domain_is_decisive(
     assert body["verdict"] == "scam"
 
 
+@pytest.mark.db
 async def test_report_endpoint_upserts_and_logs(
-    make_client: ClientFactory, db_session: AsyncSession
+    make_db_client: ClientFactory, db_session: AsyncSession
 ) -> None:
     value = f"test-{uuid.uuid4().hex[:10]}@ybl"
-    async with make_client() as client:
+    async with make_db_client() as client:
         analysis = (await client.post("/analyze/upi", json={"upi_id": value})).json()
         first = await client.post(
             "/report",
@@ -177,14 +180,12 @@ async def test_report_rejects_bad_input(make_client: ClientFactory, payload: dic
 
 
 async def test_report_unknown_analysis_404(
-    make_client: ClientFactory, db_session: AsyncSession
+    make_client: ClientFactory, fake_session: FakeSession
 ) -> None:
-    before = (await db_session.execute(select(func.count()).select_from(Report))).scalar_one()
     async with make_client() as client:
         resp = await client.post(
             "/report",
             json={"entity_type": "phone", "value": "9999900009", "analysis_id": str(uuid.uuid4())},
         )
     assert resp.status_code == 404
-    after = (await db_session.execute(select(func.count()).select_from(Report))).scalar_one()
-    assert after == before
+    assert fake_session.rows == {}  # no report was saved

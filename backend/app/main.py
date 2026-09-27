@@ -9,6 +9,7 @@ from app.api.routes import analyze, health, report
 from app.core.config import get_settings
 from app.core.logging import RequestIDMiddleware, setup_logging
 from app.db.session import create_engine, create_sessionmaker
+from app.services.embeddings import FastEmbedder
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.engine = engine
     app.state.sessionmaker = create_sessionmaker(engine)
     app.state.http_client = new_http_client(settings.HTTP_TIMEOUT_S)
+    # Loads in a worker thread; until it's ready the pattern signal reports "unavailable".
+    app.state.embedder = FastEmbedder(
+        settings.EMBEDDING_MODEL, settings.EMBEDDING_CACHE_DIR, settings.EMBEDDING_DIM
+    )
+    app.state.embedder.start_loading()
     logger.info("startup complete", extra={"extra_fields": {"env": settings.ENV}})
     try:
         yield

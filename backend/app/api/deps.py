@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
 from app.db.session import SessionFactory
+from app.services import rag
 
 
 async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
@@ -38,3 +39,17 @@ async def get_http_client(
         return
     async with new_http_client(settings.HTTP_TIMEOUT_S) as client:
         yield client
+
+
+def get_pattern_search(
+    request: Request, settings: Annotated[Settings, Depends(get_settings)]
+) -> rag.PatternSearch | None:
+    """Embedder (loaded at startup) + pgvector retrieval. None if the app started without
+    an embedder or a database."""
+    embedder = getattr(request.app.state, "embedder", None)
+    session_factory = get_session_factory(request)
+    if embedder is None or session_factory is None:
+        return None
+    return rag.PatternSearch(
+        embedder, rag.retriever_in(session_factory), rag.PatternParams.from_settings(settings)
+    )

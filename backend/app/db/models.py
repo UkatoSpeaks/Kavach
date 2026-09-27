@@ -20,7 +20,7 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.config import get_settings
-from app.core.enums import EntityType, InputType, Verdict
+from app.core.enums import EntityType, InputType, PatternKind, Verdict
 from app.db.base import Base
 
 EMBEDDING_DIM = get_settings().EMBEDDING_DIM
@@ -131,6 +131,7 @@ class Report(Base):
 class ScamPattern(Base):
     __tablename__ = "scam_patterns"
     __table_args__ = (
+        _one_of("kind", PatternKind, "kind"),
         Index(
             "ix_scam_patterns_embedding_hnsw",
             "embedding",
@@ -143,9 +144,12 @@ class ScamPattern(Base):
     slug: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     title: Mapped[str] = mapped_column(Text, nullable=False)
     category: Mapped[str] = mapped_column(Text, nullable=False)
+    # scam, or genuine: a legitimate message type that is easily mistaken for a scam.
+    kind: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'scam'"))
     content: Mapped[str] = mapped_column(Text, nullable=False)
     source_url: Mapped[str | None] = mapped_column(Text)
-    # sha256 of content; lets the ingest script skip re-embedding unchanged docs.
+    # sha256 of the embedding model name + the embedded text (title + content); lets the
+    # ingest script skip re-embedding unchanged docs.
     content_hash: Mapped[str] = mapped_column(Text, nullable=False)
     # Nullable so a doc can be stored before its embedding is computed.
     embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIM))

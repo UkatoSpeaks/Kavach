@@ -1,7 +1,7 @@
 """Community-reported entities (UPI IDs, phones, URLs, domains) -> the "reputation" signal."""
 
 import re
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from urllib.parse import urlsplit
 
 from sqlalchemy import func, select, tuple_
@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.enums import EntityType, Severity
 from app.db.models import ReportedEntity
+from app.db.session import SessionFactory
 from app.schemas.analysis import RedFlag
 from app.schemas.entities import ExtractedEntities
 from app.services.extractors import extract_phones, extract_urls
@@ -111,6 +112,21 @@ async def find_reported(
         )
     )
     return list((await session.execute(stmt)).scalars())
+
+
+# Looks up reported entities by (type, normalized value). The app uses the database
+# (find_reported_in); tests can pass an in-memory stand-in.
+FindReported = Callable[[Sequence[tuple[EntityType, str]]], Awaitable[Sequence[ReportedEntity]]]
+
+
+def find_reported_in(session_factory: SessionFactory) -> FindReported:
+    """find_reported on a short-lived session of its own."""
+
+    async def lookup(keys: Sequence[tuple[EntityType, str]]) -> Sequence[ReportedEntity]:
+        async with session_factory() as session:
+            return await find_reported(session, keys)
+
+    return lookup
 
 
 # --------------------------------------------------------------------------- signal
