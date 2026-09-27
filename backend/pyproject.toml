@@ -7,7 +7,9 @@ dependencies = [
     "asyncpg>=0.31.0",
     "fastapi>=0.141.1",
     "fastembed>=0.8.1",
+    "groq>=1.7.0",
     "httpx>=0.28.1",
+    "langgraph>=1.2.12",
     "pgvector>=0.5.0",
     "pillow>=12.3.0",
     "pydantic>=2.13.5",
@@ -41,5 +43,9 @@ select = ["E", "F", "I", "B", "UP", "ASYNC"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 # DB tests round-trip to Supabase and are slow; run them with `-m db` (or everything: -m "").
-addopts = '-m "not db"'
-markers = ["db: touches the real database (Supabase); deselected by default"]
+# LLM tests call the real Groq API (uses quota); run them with `-m llm`.
+addopts = '-m "not db and not llm"'
+markers = [
+    "db: touches the real database (Supabase); deselected by default",
+    "llm: calls the real Groq API; deselected by default",
+]

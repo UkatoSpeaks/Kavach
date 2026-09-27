@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings, get_settings
 from app.db.session import SessionFactory
 from app.services import rag
+from app.services.agent.llm import Reasoner
 
 
 async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
@@ -53,3 +54,9 @@ def get_pattern_search(
     return rag.PatternSearch(
         embedder, rag.retriever_in(session_factory), rag.PatternParams.from_settings(settings)
     )
+
+
+def get_reasoner(request: Request) -> Reasoner | None:
+    """The Groq reasoner created at startup, or None (no GROQ_API_KEY): then the LLM
+    signal is reported unavailable and template explanations are used."""
+    return getattr(request.app.state, "reasoner", None)

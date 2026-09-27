@@ -5,7 +5,7 @@ routes don't round-trip to Supabase. Real persistence is covered by the @pytest.
 import hashlib
 import re
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any
@@ -13,6 +13,7 @@ from typing import Any
 from app.core.enums import EntityType
 from app.db.models import ReportedEntity
 from app.services import rag
+from app.services.agent.llm import Evidence, LLMAssessment, ReasonResult
 from app.services.embeddings import EmbeddingUnavailable, unit
 from app.services.knowledge_base import PatternDoc, load_docs
 from app.services.reputation import normalize
@@ -121,3 +122,35 @@ def fake_pattern_search(docs: Sequence[PatternDoc] | None = None) -> rag.Pattern
     docs = _kb_docs() if docs is None else docs
     retriever = rag.InMemoryRetriever([(d, embedder.vector(d.embed_text)) for d in docs])
     return rag.PatternSearch(embedder, retriever)
+
+
+def assessment(risk: int, scam_type: str = "none", **overrides: Any) -> LLMAssessment:
+    """A valid LLM assessment."""
+    fields: dict[str, Any] = {
+        "scam_type": scam_type,
+        "llm_risk": risk,
+        "explanation_en": f"LLM explanation (risk {risk}).",
+        "explanation_hi": "यह संदेश एलएलएम ने समझाया है, ध्यान से पढ़ें।",
+        "advice": ["Do not reply.", "Block the sender.", "Check in the official app."],
+        "cited_flags": [],
+        "confidence": "high",
+    }
+    return LLMAssessment.model_validate(fields | overrides)
+
+
+class FakeReasoner:
+    """Stands in for GroqReasoner. `respond` maps the evidence to an assessment (None: the
+    LLM failed and templates are used), or raises to simulate a bug."""
+
+    def __init__(
+        self, respond: Callable[[Evidence], LLMAssessment | None] | LLMAssessment | None
+    ) -> None:
+        self._respond = respond
+        self.calls: list[Evidence] = []
+
+    async def reason(self, evidence: Evidence) -> ReasonResult:
+        self.calls.append(evidence)
+        a = self._respond(evidence) if callable(self._respond) else self._respond
+        if a is None:
+            return ReasonResult(None, None, ("fake-model: rate limited (429)",))
+        return ReasonResult(a, "fake-model")

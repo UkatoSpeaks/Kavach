@@ -9,6 +9,8 @@ from app.api.routes import analyze, health, report
 from app.core.config import get_settings
 from app.core.logging import RequestIDMiddleware, setup_logging
 from app.db.session import create_engine, create_sessionmaker
+from app.services.agent.graph import get_graph
+from app.services.agent.llm import GroqReasoner, LRUTTLCache
 from app.services.embeddings import FastEmbedder
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.EMBEDDING_MODEL, settings.EMBEDDING_CACHE_DIR, settings.EMBEDDING_DIM
     )
     app.state.embedder.start_loading()
+    app.state.graph = get_graph()  # compiled once, shared by every request
+    app.state.reasoner = (
+        GroqReasoner(
+            api_key=settings.GROQ_API_KEY,
+            model=settings.GROQ_MODEL,
+            fallback_model=settings.GROQ_FALLBACK_MODEL,
+            timeout_s=settings.LLM_TIMEOUT_S,
+            cache=LRUTTLCache(settings.LLM_CACHE_SIZE, settings.LLM_CACHE_TTL_S),
+        )
+        if settings.GROQ_API_KEY
+        else None
+    )
     logger.info("startup complete", extra={"extra_fields": {"env": settings.ENV}})
     try:
         yield

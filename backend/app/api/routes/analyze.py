@@ -5,7 +5,7 @@ from typing import Annotated, Literal
 from uuid import UUID
 
 import httpx
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import (
     get_http_client,
     get_pattern_search,
+    get_reasoner,
     get_session,
     get_session_factory,
 )
@@ -22,9 +23,11 @@ from app.db.models import Analysis
 from app.db.session import SessionFactory
 from app.schemas.analysis import AnalysisResult
 from app.services import qr, rag, reputation
+from app.services.agent.graph import run_analysis
+from app.services.agent.llm import Reasoner
 from app.services.cache import LookupCache
 from app.services.extractors import extract_upi_ids, extract_urls, parse_upi_uri
-from app.services.pipeline import Checks, PipelineOutput, analyze
+from app.services.pipeline import Checks, PipelineOutput
 
 router = APIRouter(tags=["analysis"])
 logger = logging.getLogger(__name__)
@@ -49,6 +52,11 @@ async def get_checks(
 
 
 ChecksDep = Annotated[Checks, Depends(get_checks)]
+ReasonerDep = Annotated[Reasoner | None, Depends(get_reasoner)]
+ExplainQuery = Annotated[
+    bool,
+    Query(description="false skips the LLM step: template explanations, no LLM quota used."),
+]
 
 
 class AnalyzeTextRequest(BaseModel):
@@ -121,6 +129,7 @@ async def _save(
             include={
                 "risk_score", "verdict", "scam_type", "red_flags", "signal_breakdown",
                 "explanation_en", "explanation_hi", "advice", "similar_patterns",
+                "confidence",
             },
         ),
     )  # fmt: skip
@@ -138,26 +147,52 @@ async def _save(
 
 @router.post("/analyze/text", response_model=AnalysisResult)
 async def analyze_text_route(
-    body: AnalyzeTextRequest, session: SessionDep, settings: SettingsDep, checks: ChecksDep
+    body: AnalyzeTextRequest,
+    session: SessionDep,
+    settings: SettingsDep,
+    checks: ChecksDep,
+    reasoner: ReasonerDep,
+    explain: ExplainQuery = True,
 ) -> AnalysisResult:
-    out = await analyze(body.text, settings, checks=checks, language_hint=body.language_hint)
+    out = await run_analysis(
+        body.text,
+        settings,
+        checks=checks,
+        reasoner=reasoner,
+        language_hint=body.language_hint,
+        explain=explain,
+    )
     return await _save(session, out, InputType.TEXT, body.text, body.language_hint)
 
 
 @router.post("/analyze/url", response_model=AnalysisResult)
 async def analyze_url_route(
-    body: AnalyzeURLRequest, session: SessionDep, settings: SettingsDep, checks: ChecksDep
+    body: AnalyzeURLRequest,
+    session: SessionDep,
+    settings: SettingsDep,
+    checks: ChecksDep,
+    reasoner: ReasonerDep,
+    explain: ExplainQuery = True,
 ) -> AnalysisResult:
-    out = await analyze(body.url, settings, checks=checks, message_text=False)
+    out = await run_analysis(
+        body.url, settings, checks=checks, reasoner=reasoner, message_text=False, explain=explain
+    )
     return await _save(session, out, InputType.URL, body.url)
 
 
 @router.post("/analyze/upi", response_model=AnalysisResult)
 async def analyze_upi_route(
-    body: AnalyzeUPIRequest, session: SessionDep, settings: SettingsDep, checks: ChecksDep
+    body: AnalyzeUPIRequest,
+    session: SessionDep,
+    settings: SettingsDep,
+    checks: ChecksDep,
+    reasoner: ReasonerDep,
+    explain: ExplainQuery = True,
 ) -> AnalysisResult:
     value = body.upi_id or body.upi_uri or ""
-    out = await analyze(value, settings, checks=checks, message_text=False)
+    out = await run_analysis(
+        value, settings, checks=checks, reasoner=reasoner, message_text=False, explain=explain
+    )
     return await _save(session, out, InputType.UPI, value)
 
 
@@ -174,7 +209,9 @@ async def analyze_qr_route(
     session: SessionDep,
     settings: SettingsDep,
     checks: ChecksDep,
+    reasoner: ReasonerDep,
     image: Annotated[UploadFile, File(description="PNG or JPEG, max 5 MB")],
+    explain: ExplainQuery = True,
 ) -> AnalysisResult:
     data = await image.read(qr.MAX_IMAGE_BYTES + 1)
     try:
@@ -187,8 +224,13 @@ async def analyze_qr_route(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     # upi:// payloads go to the UPI check and URLs to url_intel (both via the entities the
     # extractor finds); plain text is analyzed like a message.
-    out = await analyze(
-        decoded.payload, settings, checks=checks, message_text=decoded.kind == "text"
+    out = await run_analysis(
+        decoded.payload,
+        settings,
+        checks=checks,
+        reasoner=reasoner,
+        message_text=decoded.kind == "text",
+        explain=explain,
     )
     return await _save(session, out, InputType.QR, decoded.payload)
 

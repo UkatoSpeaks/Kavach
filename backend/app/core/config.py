@@ -42,7 +42,16 @@ class Settings(BaseSettings):
 
     DATABASE_URL: str
     GROQ_API_KEY: str = ""
-    GROQ_MODEL: str = "llama-3.3-70b-versatile"
+    GROQ_MODEL: str = "openai/gpt-oss-120b"
+    # Used when GROQ_MODEL is rate limited (429) or errors; after that, template explanations.
+    GROQ_FALLBACK_MODEL: str = "openai/gpt-oss-20b"
+    LLM_TIMEOUT_S: float = 8.0
+    # In-process cache of LLM results, to protect the free-tier quota.
+    LLM_CACHE_SIZE: int = 500
+    LLM_CACHE_TTL_S: int = 3600
+    # If the LLM's risk differs from the other signals' score by more than this, it is left
+    # out of the score and the response confidence is "low" (see app/services/scoring.py).
+    LLM_MAX_DISAGREEMENT: float = 50
     ENV: Literal["dev", "test", "prod"] = "dev"
     LOG_LEVEL: str = "INFO"
     # Local embedding model (fastembed/ONNX) for scam-pattern retrieval. Must be multilingual

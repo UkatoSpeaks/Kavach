@@ -1,6 +1,7 @@
 """The AnalysisResult contract returned by every analysis endpoint (see CLAUDE.md)."""
 
 from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -53,3 +54,8 @@ class AnalysisResult(BaseModel):
     explanation_hi: str = ""
     advice: list[str] = Field(default_factory=list)
     similar_patterns: list[SimilarPattern] = Field(default_factory=list)
+    confidence: Literal["low", "medium", "high"] | None = Field(
+        default=None,
+        description="The LLM's confidence in its explanation; 'low' if it disagreed strongly "
+        "with the other signals and was overruled. None if no LLM was used.",
+    )

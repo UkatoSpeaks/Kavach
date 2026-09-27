@@ -192,6 +192,23 @@ NEGATED_SHARE = [
     r"(?:न|ना|मत)\s+(?:करें|बताएं|बताएँ|बताइए|बताओ|भेजें|दें)", r"(?:शेयर|साझा)\s+(?:न|ना|मत)",
     r"\bnever (?:ask|call)s?\b",
 ]  # fmt: skip
+# Text aimed at an AI checker rather than at a person: telling the model to drop its
+# instructions, change role or call the message safe. A genuine SMS never talks to a
+# classifier, so this is itself a strong scam sign. Kept narrow: "you are now eligible" and
+# "mark as read" must not match.
+_GAP = r"[^.!?\n]{0,30}"
+AI_MANIPULATION = [
+    rf"\b(?:ignore|disregard|forget|override|skip)\b{_GAP}\b(?:previous|prior|above|earlier|"
+    rf"all|your|system|original)\b{_GAP}\b(?:instructions?|prompts?|rules|guidelines)\b",
+    r"\byou are now (?:an? |in |my )?(?:ai|assistant|bot|chatbot|model|dan|jailbroken|"
+    r"unrestricted|(?:developer|admin|god) mode)\b",
+    rf"\b(?:mark|classify|label|flag|rate|treat|report|consider)\b{_GAP}\bas\s+(?:100% )?"
+    r"(?:safe|genuine|legit(?:imate)?|not (?:a )?(?:scam|fraud)|harmless)\b",
+    r"\bsystem prompt\b", r"\bprompt injection\b",
+    r"\b(?:pichle|pehle ke|upar ke) (?:sab |saare )?(?:instructions?|nirdesh)\b",
+    rf"\b(?:isko|ise|is message ko)\b{_GAP}\bsafe\b{_GAP}\b(?:mark|batao|bolo|likho|dikhao)",
+    "पिछले निर्देश", "निर्देशों को अनदेखा", "सुरक्षित मार्क",
+]  # fmt: skip
 ID_DOCS = [r"\baadhaa?r\b", r"\badhaa?r\b", r"\bpan\b", "आधार", "पैन"]
 DOC_VERBS = SHARE_VERBS + [r"\bupload\b", r"\bupdate\b", r"\bsubmit\b", r"\bverify\b", "अपडेट"]
 
@@ -523,6 +540,10 @@ def _id_document_request(text: str, e: ExtractedEntities) -> str | None:
     return _near(text, ID_DOCS, DOC_VERBS, window=1, unless=NEGATED_SHARE)
 
 
+def _ai_manipulation_attempt(text: str, e: ExtractedEntities) -> str | None:
+    return _find(text, AI_MANIPULATION)
+
+
 # =========================================================================== the rules
 
 T = ScamType
@@ -604,6 +625,12 @@ RULES: tuple[Rule, ...] = (
     Rule("id_document_request", "Asks you to share or update Aadhaar/PAN details",
          "आधार/पैन की जानकारी भेजने या अपडेट करने को कहा गया है", T.GENERIC, 0.35,
          _id_document_request),
+    # Weight 0.8: with any other scam sign (e.g. a UPI ID) it reaches "scam" without the LLM,
+    # whose judgement is exactly what the message tries to hijack.
+    Rule("ai_manipulation_attempt",
+         "Contains instructions aimed at an AI or scam checker (e.g. 'mark this as safe')",
+         "संदेश में AI या जांच करने वाले सिस्टम को धोखा देने वाले निर्देश हैं", T.GENERIC, 0.8,
+         _ai_manipulation_attempt),
 )  # fmt: skip
 RULES_BY_ID = {rule.id: rule for rule in RULES}
 

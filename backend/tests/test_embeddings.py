@@ -1,6 +1,5 @@
 """FastEmbedder's loading behaviour, with fastembed replaced by an instant fake module."""
 
-import asyncio
 import sys
 import threading
 import time
@@ -80,7 +79,7 @@ async def test_embed_fails_fast_while_loading_in_background(tmp_path: Path) -> N
 
 async def test_failed_load_is_unavailable_and_retried_later(tmp_path: Path) -> None:
     FakeTextEmbedding.fail = OSError("no space left on device")
-    e = _embedder(tmp_path, retry_after_s=0.05)
+    e = _embedder(tmp_path, retry_after_s=60)
     with pytest.raises(EmbeddingUnavailable, match="no space left"):
         await e.load_async()
     with pytest.raises(EmbeddingUnavailable, match="failed to load: OSError"):
@@ -88,7 +87,7 @@ async def test_failed_load_is_unavailable_and_retried_later(tmp_path: Path) -> N
     assert e._background is None
 
     FakeTextEmbedding.fail = None
-    await asyncio.sleep(0.06)
+    e._failed_at -= 61  # the retry wait is over
     await e.load_async()
     assert e.ready
 

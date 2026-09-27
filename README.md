@@ -47,6 +47,11 @@ Check it at http://127.0.0.1:8000/health. The response should be:
 ```
 
 If the database can't be reached, `db` holds the error message and the endpoint still returns 200.
+
+Every `/analyze/*` call runs the LangGraph agent (extract → checks → LLM → scoring). The LLM
+step uses Groq (`GROQ_API_KEY`; models in `GROQ_MODEL` / `GROQ_FALLBACK_MODEL`) and only
+explains: its risk is a low-weight signal that can never make a result a scam on its own.
+Add `?explain=false` to skip it (template explanations, no Groq quota used).
 Interactive API docs: http://127.0.0.1:8000/docs
 
 To skip the `uv run` prefix, activate the venv once per shell with `.\.venv\Scripts\Activate.ps1`.
@@ -56,7 +61,8 @@ To skip the `uv run` prefix, activate the venv once per shell with `.\.venv\Scri
 ```powershell
 cd backend
 uv run pytest -q              # fast tests only: no database, no network (a few seconds)
-uv run pytest -q -m db        # only the tests that hit the real database (Supabase, ~1 min)
+uv run pytest -q -m db        # only the tests that hit the real database (Supabase, ~2 min)
+uv run pytest -q -m llm       # only the tests that call the real Groq API (uses quota)
 uv run pytest -q -m ""        # everything
 uv run ruff check .
 uv run ruff format --check .
@@ -74,6 +80,6 @@ embedding model and checks that the 36 labelled examples keep their verdicts.
 cd backend
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install fastapi "uvicorn[standard]" pydantic pydantic-settings "sqlalchemy[asyncio]" asyncpg alembic pgvector httpx python-dotenv fastembed pyyaml pytest pytest-asyncio ruff
+pip install fastapi "uvicorn[standard]" pydantic pydantic-settings "sqlalchemy[asyncio]" asyncpg alembic pgvector httpx python-dotenv fastembed pyyaml langgraph groq pytest pytest-asyncio ruff
 uvicorn app.main:app --reload
 ```

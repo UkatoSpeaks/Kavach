@@ -1,6 +1,6 @@
 """Combine per-layer signals into the final risk score and verdict.
 
-Each layer (rules, url_intel, upi_check, reputation; classifier, pattern_similarity, llm
+Each layer (rules, url_intel, upi_check, reputation, pattern_similarity, llm; classifier
 later) reports a SignalOutcome with a 0-100 score. The final score is the weighted mean of
 the available signals, with weights from config renormalized over the signals that count.
 
@@ -17,10 +17,25 @@ sets `floor`, the minimum final score its evidence justifies.
 The opposite also exists: weak, supporting evidence (similarity to known scam patterns) sets
 `can_decide_scam=False`. It may nudge the score, but if the result is only a scam because of
 such signals, the score is capped just below the scam threshold.
+
+The LLM ("llm" signal) gets the tightest limits, because it is the one layer the message
+itself can try to steer (prompt injection) and the one that can hallucinate:
+- Low weight in config (SIGNAL_WEIGHTS["llm"], 0.15 by default).
+- It never sets a floor, and floors from other signals are applied after the weighted mean,
+  so it can never pull the score below a minimum another signal set.
+- can_decide_scam=False: it can never make a result "scam" on its own (same cap as
+  pattern_similarity: the score stops at scam_min - 1).
+- max_disagreement=50: if its risk differs from the score of all the other signals by more
+  than 50 points, it is left out of the score entirely, so the verdict stays the one the
+  rules and checks produced. The caller reports confidence "low" and uses the template
+  explanation, since the LLM's text would contradict the verdict.
+- When the message tries to manipulate an AI checker (rule ai_manipulation_attempt), the
+  LLM's risk is left out of the score altogether, and its text is only used if it saw
+  through the attempt (see agent/nodes.llm_signal).
 """
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from app.core.enums import ScamType, Severity, Verdict
 from app.schemas.analysis import RedFlag, Signal, SimilarPattern
@@ -38,6 +53,8 @@ class SignalOutcome:
     scam_type: ScamType | None = None  # the layer's guess, used if the rules have none
     similar_patterns: tuple[SimilarPattern, ...] = ()
     can_decide_scam: bool = True  # False: must not make a result "scam" on its own
+    # Left out of the score if it differs from the other signals' score by more than this.
+    max_disagreement: float | None = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +72,7 @@ class ScoreResult:
     strong_rule_floor_applied: bool = False
     floor_source: str | None = None  # signal whose evidence floor set the score
     scam_capped: bool = False  # only supporting signals made it a scam, so it was capped
+    ignored: tuple[str, ...] = ()  # signals left out for disagreeing with all the others
 
 
 def severity_for(weight: float) -> Severity:
@@ -123,6 +141,8 @@ def score(
 ) -> ScoreResult:
     """Final score from the rules signal plus any other layers' outcomes."""
     outcomes = [rules_signal(rule_result, rules_informative_if_empty), *extra]
+    outcomes, ignored = _drop_strong_disagreement(outcomes, weights)
+    extra = outcomes[1:]
     risk_score, breakdown = combine_signals(outcomes, weights)
     risk_score, top = _apply_floor(risk_score, extra)
     floor_source = None
@@ -150,7 +170,35 @@ def score(
     if verdict is Verdict.SAFE and rule_result.max_weight >= thresholds.strong_rule_weight:
         risk_score, verdict, floor_applied = thresholds.suspicious_min, Verdict.SUSPICIOUS, True
 
-    return ScoreResult(risk_score, verdict, breakdown, floor_applied, floor_source, scam_capped)
+    return ScoreResult(
+        risk_score, verdict, breakdown, floor_applied, floor_source, scam_capped, ignored
+    )
+
+
+def _drop_strong_disagreement(
+    outcomes: list[SignalOutcome], weights: Mapping[str, float]
+) -> tuple[list[SignalOutcome], tuple[str, ...]]:
+    """Mark signals with max_disagreement as uninformative when they are further than that
+    from the score (floors included) of every other signal."""
+    kept: list[SignalOutcome] = []
+    ignored: list[str] = []
+    for o in outcomes:
+        if o.max_disagreement is None or o.score is None or not o.informative:
+            kept.append(o)
+            continue
+        others = [x for x in outcomes if x is not o]
+        base, _ = combine_signals(others, weights)
+        base, _ = _apply_floor(base, others)
+        if abs(o.score - base) > o.max_disagreement:
+            ignored.append(o.source)
+            o = replace(
+                o,
+                informative=False,
+                detail=f"{o.detail}; ignored: disagrees with the other signals ({base}) by "
+                f"more than {o.max_disagreement:g} points",
+            )
+        kept.append(o)
+    return kept, tuple(ignored)
 
 
 def _apply_floor(

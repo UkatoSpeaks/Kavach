@@ -11,13 +11,14 @@ from fastapi import Depends, FastAPI
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_http_client, get_session, get_session_factory
+from app.api.deps import get_http_client, get_reasoner, get_session, get_session_factory
 from app.api.routes.analyze import get_checks
 from app.core.config import Settings, get_settings
 from app.db.models import UrlCache
 from app.db.session import create_engine
 from app.main import create_app
 from app.services import url_intel
+from app.services.agent.llm import Reasoner
 from app.services.cache import LookupCache
 from app.services.pipeline import Checks
 from tests.fakes import FakeSession, InMemoryReputation, fake_pattern_search
@@ -81,13 +82,16 @@ def make_client(fake_session: FakeSession, reputation_store: InMemoryReputation)
 
     Analyses are saved to fake_session, reputation comes from reputation_store, the
     url_cache is in-memory (per request) and pattern retrieval runs in memory over the real
-    knowledge-base docs with FakeEmbedder. Outbound HTTP is not mocked here; tests wrap
+    knowledge-base docs with FakeEmbedder. The LLM step is off (reported unavailable) unless
+    a test passes reasoner=, e.g. a tests.fakes.FakeReasoner; the real Groq API is never
+    called here. Outbound HTTP is not mocked here; tests wrap
     calls in respx.mock.
     """
 
-    def build(**settings_overrides: Any) -> httpx.AsyncClient:
+    def build(reasoner: Reasoner | None = None, **settings_overrides: Any) -> httpx.AsyncClient:
         app = create_app()
         patterns = fake_pattern_search()
+        app.dependency_overrides[get_reasoner] = lambda: reasoner
 
         async def checks_override(
             client: Annotated[httpx.AsyncClient, Depends(get_http_client)],

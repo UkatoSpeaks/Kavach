@@ -86,6 +86,7 @@ class Analysis(Base):
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )
     language_hint: Mapped[str | None] = mapped_column(Text)
+    confidence: Mapped[str | None] = mapped_column(Text)  # low | medium | high, None: no LLM
     # Per-layer timings, e.g. {"rules": 3, "classifier": 41, "llm": 820}.
     latency_ms: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'{}'::jsonb")
