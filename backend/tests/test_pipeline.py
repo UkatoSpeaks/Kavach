@@ -103,6 +103,24 @@ async def test_network_down_marks_signals_unavailable() -> None:
     assert {"extract", "rules", "url_intel", "reputation", "scoring"} <= set(out.latency_ms)
 
 
+async def test_offline_checks_make_no_network_calls(fake_dns: dict[str, list[str]]) -> None:
+    """Checks(network=False), used by ml/evaluate.py for reproducible runs."""
+    text = "Win cashback, claim at https://sbi-rewards.top/claim or call 9123456780"
+    fake_dns["sbi-rewards.top"] = []  # a DNS lookup would fail loudly in the detail
+    with respx.mock as router:
+        async with httpx.AsyncClient() as client:
+            checks = Checks(
+                client, LookupCache(None, timedelta(hours=24)), None, fake_pattern_search(),
+                network=False,
+            )  # fmt: skip
+            out = await analyze(text, SETTINGS, checks=checks)
+    assert router.calls.call_count == 0
+    by_source = {s.source: s for s in out.result.signal_breakdown}
+    assert by_source["url_intel"].detail == "unavailable: offline (network checks disabled)"
+    assert by_source["url_intel"].weight == 0
+    assert out.result.verdict is not Verdict.SAFE  # the rules still see the lookalike link
+
+
 def test_pure_analysis_makes_no_network_calls() -> None:
     with respx.mock as router:
         result = analyze_text(SCAM_EXAMPLES[9][1], get_settings()).result

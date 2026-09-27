@@ -62,6 +62,9 @@ class Checks:
     cache: LookupCache
     find_reported: reputation.FindReported | None  # None: reputation is reported unavailable
     patterns: rag.PatternSearch | None = None  # None: pattern_similarity is reported unavailable
+    # False: url_intel makes no network calls and is reported unavailable (offline evaluation
+    # runs, see ml/evaluate.py). Reputation is switched off with find_reported=None.
+    network: bool = True
 
 
 def thresholds_from(settings: Settings) -> scoring.Thresholds:
@@ -227,6 +230,10 @@ async def _reputation(keys: list[tuple[EntityType, str]], checks: Checks) -> Sig
     return reputation.reputation_signal(keys, found)
 
 
+async def _offline(source: str) -> SignalOutcome:
+    return SignalOutcome(source, None, "offline (network checks disabled)")
+
+
 async def _patterns(text: str, checks: Checks) -> SignalOutcome:
     if checks.patterns is None:
         return SignalOutcome(rag.SOURCE, None, "embedding model not configured")
@@ -251,7 +258,9 @@ async def run_checks(
     if entities.upi_ids or entities.upi_uris:
         jobs.append(_timed("upi_check", upi_check, timer, timeout))
     if checks is not None:
-        if entities.urls:
+        if entities.urls and not checks.network:
+            jobs.append(_timed("url_intel", lambda: _offline("url_intel"), timer, timeout))
+        elif entities.urls:
             jobs.append(_timed(
                 "url_intel",
                 lambda: url_intel.url_intel(

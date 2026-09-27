@@ -13,6 +13,11 @@ __pycache__/
 # ML artifacts / large data
 *.onnx
 backend/data/datasets/raw/
+# Your collected messages (personal data, not anonymized) and everything derived from them.
+backend/data/datasets/collected/
+backend/data/datasets/synthetic/
+backend/data/datasets/processed/*
+!backend/data/datasets/processed/.gitkeep
 
 # Editors / OS
 .vscode/

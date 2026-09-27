@@ -1,0 +1,4 @@
+text,label,scam_type,source,source_url,date_collected,notes
+"Hello sir, maine galti se aapke Paytm pe ₹3,000 bhej diye. Please wapas kar do, mera UPI ID hai rohit.sharma@ybl",scam,sent_by_mistake,family WhatsApp,,2026-09-20,"Example row. Forwarded by an uncle; no money had actually arrived."
+"Dear Customer, your electricity connection will be disconnected tonight at 9:30 PM as your last bill is not updated. Call officer 9123456780 immediately.",scam,phishing_link,my SMS,,2026-09-21,"Example row. Sender ID was a 10-digit mobile number, not a DISCOM header."
+"Rs.500.00 debited from A/c XX1234 to VPA swiggy.stores@icici on 12-09-26. UPI Ref No 412345678901. Not you? Call 18002586161. -Canara Bank",genuine,,my SMS,,2026-09-21,"Example row. Real debit alert, matched my bank statement."
