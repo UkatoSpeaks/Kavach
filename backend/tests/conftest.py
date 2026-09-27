@@ -51,14 +51,20 @@ def fake_dns(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
 ClientFactory = Callable[..., httpx.AsyncClient]
 
 
-def _client(app: FastAPI, session: object, **settings_overrides: Any) -> httpx.AsyncClient:
+def settings_for_tests(**overrides: Any) -> Settings:
+    """The local settings with test defaults and overrides applied (not re-validated)."""
+    # Independent of the local .env: Safe Browsing is off unless a test turns it on.
+    overrides.setdefault("SAFE_BROWSING_API_KEY", "")
+    # Tests send many requests from one address; tests/test_protection.py turns it on.
+    overrides.setdefault("RATE_LIMIT_ENABLED", False)
+    return get_settings().model_copy(update=overrides)
+
+
+def _client(app: FastAPI, session: object, settings: Settings) -> httpx.AsyncClient:
     async def session_override() -> AsyncIterator[object]:
         yield session
 
     app.dependency_overrides[get_session] = session_override
-    # Independent of the local .env: Safe Browsing is off unless a test turns it on.
-    settings_overrides.setdefault("SAFE_BROWSING_API_KEY", "")
-    settings = get_settings().model_copy(update=settings_overrides)
     app.dependency_overrides[get_settings] = lambda: settings
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
 
@@ -90,7 +96,8 @@ def make_client(fake_session: FakeSession, reputation_store: InMemoryReputation)
     """
 
     def build(reasoner: Reasoner | None = None, **settings_overrides: Any) -> httpx.AsyncClient:
-        app = create_app()
+        settings = settings_for_tests(**settings_overrides)
+        app = create_app(settings)
         patterns = fake_pattern_search()
         app.dependency_overrides[get_reasoner] = lambda: reasoner
         factory = session_factory(fake_session)
@@ -104,7 +111,7 @@ def make_client(fake_session: FakeSession, reputation_store: InMemoryReputation)
             return Checks(client, LookupCache(None, ttl), reputation_store, patterns)
 
         app.dependency_overrides[get_checks] = checks_override
-        return _client(app, fake_session, **settings_overrides)
+        return _client(app, fake_session, settings)
 
     return build
 
@@ -164,9 +171,10 @@ async def make_db_client(db_session: AsyncSession) -> ClientFactory:
     await db_session.execute(delete(UrlCache))
 
     def build(**settings_overrides: Any) -> httpx.AsyncClient:
-        app = create_app()
+        settings = settings_for_tests(**settings_overrides)
+        app = create_app(settings)
         factory = SharedSessionFactory(db_session)
         app.dependency_overrides[get_session_factory] = lambda: factory
-        return _client(app, db_session, **settings_overrides)
+        return _client(app, db_session, settings)
 
     return build

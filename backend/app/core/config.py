@@ -1,10 +1,12 @@
+import json
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import quote, unquote
 
+from limits import parse_many
 from pydantic import field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 
@@ -56,14 +58,41 @@ class Settings(BaseSettings):
     # If the LLM's risk differs from the other signals' score by more than this, it is left
     # out of the score and the response confidence is "low" (see app/services/scoring.py).
     LLM_MAX_DISAGREEMENT: float = 50
+    # "production" and "development" are accepted as aliases of prod and dev.
     ENV: Literal["dev", "test", "prod"] = "dev"
     LOG_LEVEL: str = "INFO"
+
+    # API protection. Rate limits are per client IP, in memory (per process), in the
+    # `limits` notation: "10/minute", "100/hour", "5/minute;50/day". All /analyze/* routes
+    # share one budget.
+    RATE_LIMIT_ENABLED: bool = True
+    RATE_LIMIT_ANALYZE: str = "10/minute"
+    RATE_LIMIT_REPORT: str = "5/minute"
+    # How many proxies in front of the app append to X-Forwarded-For. The header is only
+    # used when the direct peer is a private address (the platform's proxy); the client IP
+    # is then the entry this many places from the right. 0: ignore the header. On Render
+    # it is 2: the header arrives as "<client>, <Cloudflare edge>" and Render's proxy
+    # appends instead of replacing, so anything further left may be forged by the client.
+    TRUSTED_PROXY_HOPS: int = 0
+    # Request body limits: JSON bodies, and multipart uploads (the QR image plus form overhead).
+    MAX_JSON_BODY_BYTES: int = 64 * 1024
+    MAX_UPLOAD_BODY_BYTES: int = 5 * 1024 * 1024 + 64 * 1024
+    # Origins allowed to call the API from a browser, as JSON or comma-separated. Empty:
+    # no CORS headers (in dev, http://localhost:3000 is allowed instead).
+    CORS_ORIGINS: Annotated[list[str], NoDecode] = []
+    # /docs, /redoc and /openapi.json. Default: on, except in prod.
+    ENABLE_DOCS: bool | None = None
+
+    # The pattern-similarity signal loads a ~525 MB (RSS) embedding model. Turn it off on
+    # small instances (Render free: 512 MB); the signal is then reported unavailable.
+    PATTERN_SIGNAL_ENABLED: bool = True
     # Local embedding model (fastembed/ONNX) for scam-pattern retrieval. Must be multilingual
     # and output EMBEDDING_DIM dims; changing the dim needs a migration, changing the model
     # needs a re-run of scripts/ingest_patterns.py.
     EMBEDDING_MODEL: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     EMBEDDING_DIM: int = 384
-    # Where the model files are downloaded (~220 MB). Gitignored.
+    # Where the model files are downloaded (~240 MB). Gitignored. Inside the project so a
+    # build-time download (scripts/download_model.py) ships with the deploy.
     EMBEDDING_CACHE_DIR: Path = BACKEND_DIR / ".cache" / "fastembed"
 
     # Pattern retrieval (see app/services/rag.py). The signal is driven by the margin
@@ -118,6 +147,44 @@ class Settings(BaseSettings):
         if not 0 <= self.PATTERN_MIN_MARGIN < self.PATTERN_FULL_MARGIN <= 1:
             raise ValueError("need 0 <= PATTERN_MIN_MARGIN < PATTERN_FULL_MARGIN <= 1")
         return self
+
+    @field_validator("ENV", mode="before")
+    @classmethod
+    def _env_aliases(cls, v: object) -> object:
+        if isinstance(v, str):
+            v = v.strip().lower()
+            return {"production": "prod", "development": "dev"}.get(v, v)
+        return v
+
+    @field_validator("CORS_ORIGINS", mode="before")
+    @classmethod
+    def _split_origins(cls, v: object) -> object:
+        if isinstance(v, str):
+            v = v.strip()
+            if v.startswith("["):
+                return json.loads(v)
+            return [o.strip().rstrip("/") for o in v.split(",") if o.strip()]
+        return v
+
+    @field_validator("RATE_LIMIT_ANALYZE", "RATE_LIMIT_REPORT")
+    @classmethod
+    def _valid_rate(cls, v: str) -> str:
+        parse_many(v)  # ValueError on bad notation: fail at startup, not on the first request
+        return v
+
+    @property
+    def is_prod(self) -> bool:
+        return self.ENV == "prod"
+
+    @property
+    def docs_enabled(self) -> bool:
+        return self.ENABLE_DOCS if self.ENABLE_DOCS is not None else not self.is_prod
+
+    @property
+    def cors_origins(self) -> list[str]:
+        if not self.CORS_ORIGINS and self.ENV == "dev":
+            return ["http://localhost:3000"]
+        return self.CORS_ORIGINS
 
     @field_validator("GROQ_REASONING_EFFORT", mode="before")
     @classmethod

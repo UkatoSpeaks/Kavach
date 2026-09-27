@@ -6,7 +6,7 @@ from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Query, UploadFile
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,6 +17,8 @@ from app.api.deps import (
     get_session,
     get_session_factory,
 )
+from app.api.errors import ApiError
+from app.api.protection import rate_limit
 from app.core.config import Settings, get_settings
 from app.core.enums import InputType
 from app.db.models import Analysis
@@ -51,6 +53,9 @@ async def get_checks(
     find = reputation.find_reported_in(session_factory) if session_factory else None
     return Checks(client=client, cache=cache, find_reported=find, patterns=patterns)
 
+
+# One budget per client IP shared by all /analyze/* routes: each can cost Groq quota.
+ANALYZE_LIMIT = rate_limit("analyze", "RATE_LIMIT_ANALYZE")
 
 ChecksDep = Annotated[Checks, Depends(get_checks)]
 ReasonerDep = Annotated[Reasoner | None, Depends(get_reasoner)]
@@ -180,7 +185,7 @@ async def save_analysis(sessions: SessionFactory | None, row: Analysis) -> None:
 SaverDep = Annotated[Saver, Depends()]
 
 
-@router.post("/analyze/text", response_model=AnalysisResult)
+@router.post("/analyze/text", response_model=AnalysisResult, dependencies=[ANALYZE_LIMIT])
 async def analyze_text_route(
     body: AnalyzeTextRequest,
     save: SaverDep,
@@ -200,7 +205,7 @@ async def analyze_text_route(
     return save(out, InputType.TEXT, body.text, body.language_hint)
 
 
-@router.post("/analyze/url", response_model=AnalysisResult)
+@router.post("/analyze/url", response_model=AnalysisResult, dependencies=[ANALYZE_LIMIT])
 async def analyze_url_route(
     body: AnalyzeURLRequest,
     save: SaverDep,
@@ -215,7 +220,7 @@ async def analyze_url_route(
     return save(out, InputType.URL, body.url)
 
 
-@router.post("/analyze/upi", response_model=AnalysisResult)
+@router.post("/analyze/upi", response_model=AnalysisResult, dependencies=[ANALYZE_LIMIT])
 async def analyze_upi_route(
     body: AnalyzeUPIRequest,
     save: SaverDep,
@@ -234,6 +239,7 @@ async def analyze_upi_route(
 @router.post(
     "/analyze/qr",
     response_model=AnalysisResult,
+    dependencies=[ANALYZE_LIMIT],
     responses={
         413: {"description": "Image larger than 5 MB"},
         415: {"description": "Not a PNG or JPEG image"},
@@ -252,11 +258,11 @@ async def analyze_qr_route(
     try:
         decoded = await asyncio.to_thread(qr.decode_qr, data)
     except qr.ImageTooLargeError as exc:
-        raise HTTPException(status_code=413, detail=str(exc)) from exc
+        raise ApiError(413, str(exc), code="image_too_large") from exc
     except qr.UnsupportedImageError as exc:
-        raise HTTPException(status_code=415, detail=str(exc)) from exc
+        raise ApiError(415, str(exc), code="unsupported_image") from exc
     except qr.NoQRCodeError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise ApiError(422, str(exc), code="no_qr_code") from exc
     # upi:// payloads go to the UPI check and URLs to url_intel (both via the entities the
     # extractor finds); plain text is analyzed like a message.
     out = await run_analysis(
@@ -274,5 +280,5 @@ async def analyze_qr_route(
 async def get_analysis(analysis_id: UUID, session: SessionDep) -> AnalysisResult:
     row = await session.get(Analysis, analysis_id)
     if row is None:
-        raise HTTPException(status_code=404, detail="analysis not found")
+        raise ApiError(404, "analysis not found")
     return AnalysisResult.model_validate(row)

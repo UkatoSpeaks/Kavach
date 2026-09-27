@@ -45,7 +45,11 @@ backend/
     main.py                 # FastAPI app, lifespan (engine, http client, embedder, graph, reasoner)
     api/
       deps.py               # session, session factory, http client, pattern search, reasoner
-      routes/               # health.py, analyze.py (/analyze/{text,url,upi,qr}, GET /analysis/{id}), report.py
+      errors.py             # {error: {code, message}} for every error; ApiError; prod hides internals
+      protection.py         # client IP behind Render's proxy, per-IP rate limits (`limits`),
+                            # body size limit, security headers
+      routes/               # health.py (/health cheap, /health/db), analyze.py
+                            # (/analyze/{text,url,upi,qr}, GET /analysis/{id}), report.py
     core/                   # config.py (settings, signal weights), enums.py, logging.py (JSON logs, request id)
     db/                     # base.py, session.py, models.py
     schemas/                # analysis.py (AnalysisResult), entities.py
@@ -75,11 +79,14 @@ backend/
     scam_patterns/          # markdown knowledge-base docs (scam + genuine patterns)
     datasets/               # raw + processed training data (gitignored if large)
   ml/                       # eval_retrieval.py; Colab notebooks later
-  scripts/                  # ingest_patterns.py (embed KB into pgvector), seed_reported.py
+  scripts/                  # ingest_patterns.py (embed KB into pgvector), seed_reported.py,
+                            # download_model.py (build step: fastembed model into the cache dir)
   tests/
     conftest.py             # make_client (no DB), make_db_client (rolled-back DB), fake DNS
     fakes.py                # FakeSession, InMemoryReputation, FakeEmbedder, FakeReasoner, ...
     examples.py             # 36 labelled messages shared by scoring/API/agent tests
+render.yaml                 # Render Blueprint (free native-Python web service, rootDir backend)
+.github/workflows/ci.yml    # ruff + fast pytest on push/PR
 ```
 
 ## Conventions
@@ -97,6 +104,13 @@ backend/
   Analyses are saved to Supabase in a background task after the response is sent; the id is
   generated up front. A failed save is logged and `GET /analysis/{id}` then returns 404.
 - Secrets only in `.env` (never committed). Provide `.env.example`.
+- Deployment: Render free tier (512 MB RAM), native Python via uv, one uvicorn worker. The
+  embedding model needs ~560 MB, so production runs with `PATTERN_SIGNAL_ENABLED=false`.
+  Migrations run as the last build step (pre-deploy is paid-only), so they must stay
+  backward compatible with the running code. `/health` must stay free of DB/network calls.
+- Every error response is `{"error": {"code", "message"}}` (raise `app.api.errors.ApiError`);
+  new abusable routes get a `rate_limit(...)` dependency. Tests build apps with
+  `create_app(settings)`; rate limits are off in tests unless a test turns them on.
 - Commands (from `backend/`, prefix with `uv run`):
   - run: `uvicorn app.main:app --reload`
   - migrate: `alembic upgrade head`; load the knowledge base: `python -m scripts.ingest_patterns`

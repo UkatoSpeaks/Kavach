@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      # The fast suite never connects to a database, calls Groq or does real HTTP/DNS;
+      # Settings just needs a well-formed URL. No secrets are used.
+      DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+      ENV: test
+      GROQ_API_KEY: ""
+      SAFE_BROWSING_API_KEY: ""
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - name: Install dependencies (Python from backend/.python-version)
+        run: uv sync --frozen
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format
+        run: uv run ruff format --check .
+
+      - name: Tests (fast suite; db and llm markers are deselected by default)
+        run: uv run pytest -q

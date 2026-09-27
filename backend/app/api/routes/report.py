@@ -1,11 +1,13 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_session
+from app.api.errors import ApiError
+from app.api.protection import rate_limit
 from app.core.enums import EntityType
 from app.db.models import Analysis, Report
 from app.services.reputation import normalize, upsert_reported_entity
@@ -35,10 +37,15 @@ class ReportResponse(BaseModel):
     is_verified_scam: bool
 
 
-@router.post("/report", response_model=ReportResponse, status_code=201)
+@router.post(
+    "/report",
+    response_model=ReportResponse,
+    status_code=201,
+    dependencies=[rate_limit("report", "RATE_LIMIT_REPORT")],
+)
 async def report_entity(body: ReportRequest, session: SessionDep) -> ReportResponse:
     if body.analysis_id is not None and await session.get(Analysis, body.analysis_id) is None:
-        raise HTTPException(status_code=404, detail="analysis not found")
+        raise ApiError(404, "analysis not found")
     entity = await upsert_reported_entity(session, body.entity_type, body.value)
     session.add(Report(entity_id=entity.id, analysis_id=body.analysis_id, reason=body.reason))
     response = ReportResponse(

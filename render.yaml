@@ -1,0 +1,90 @@
+# Render Blueprint: the Kavach API as a free native-Python web service (no Docker).
+# Step-by-step deploy instructions: README.md -> "Deploy to Render".
+services:
+  - type: web
+    name: kavach-api
+    runtime: python
+    plan: free
+    # Can't be changed after the service is created. Pick the one closest to your Supabase
+    # project (Supabase ap-south-1 Mumbai / ap-southeast-1 -> singapore; us-* -> oregon/ohio/
+    # virginia; eu-* -> frankfurt): every analysis makes several database round trips.
+    region: singapore
+    rootDir: backend
+    # Deploy only after GitHub Actions (.github/workflows/ci.yml) passes on the commit.
+    autoDeployTrigger: checksPass
+    buildFilter:
+      paths:
+        - backend/**
+        - render.yaml
+      ignoredPaths:
+        - backend/tests/**
+        - backend/ml/**
+    # 1. Install locked runtime deps into backend/.venv with Render's Python (see UV_* below).
+    # 2. Download the embedding model into backend/.cache/fastembed, which ships with the
+    #    build (skipped while PATTERN_SIGNAL_ENABLED=false).
+    # 3. Migrate the database LAST, so a failed install/download never leaves the schema
+    #    ahead of the running code. Pre-deploy commands are paid-only; see README.
+    buildCommand: >-
+      uv sync --frozen --no-dev &&
+      .venv/bin/python -m scripts.download_model &&
+      .venv/bin/alembic upgrade head
+    # One worker: the rate limits and LLM cache are in-process, and 512 MB is tight.
+    # --no-proxy-headers: uvicorn would take the client IP from the leftmost, client-forgeable
+    # X-Forwarded-For entry; the app does it correctly instead (TRUSTED_PROXY_HOPS).
+    startCommand: >-
+      .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port $PORT
+      --no-proxy-headers --no-server-header
+    healthCheckPath: /health
+    envVars:
+      # --- runtime / build
+      - key: PYTHON_VERSION
+        value: 3.12.12
+      # Fail the build instead of downloading a Python that isn't shipped with it.
+      - key: UV_PYTHON_DOWNLOADS
+        value: never
+      # Precompile .pyc at build time: faster cold starts.
+      - key: UV_COMPILE_BYTECODE
+        value: "1"
+      - key: ENV
+        value: prod
+      - key: LOG_LEVEL
+        value: INFO
+
+      # --- secrets (Render asks for these when the Blueprint is first applied)
+      # Supabase -> Connect -> Session pooler URI (IPv4; port 5432).
+      - key: DATABASE_URL
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      # Optional: leave empty to skip the Safe Browsing check.
+      - key: SAFE_BROWSING_API_KEY
+        sync: false
+
+      # --- LLM
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-120b
+      - key: GROQ_FALLBACK_MODEL
+        value: openai/gpt-oss-20b
+      - key: GROQ_REASONING_EFFORT
+        value: low
+
+      # --- protection
+      - key: RATE_LIMIT_ENABLED
+        value: "true"
+      - key: RATE_LIMIT_ANALYZE
+        value: 10/minute
+      - key: RATE_LIMIT_REPORT
+        value: 5/minute
+      # Render delivers X-Forwarded-For as "<client>, <Cloudflare edge>".
+      - key: TRUSTED_PROXY_HOPS
+        value: "2"
+      - key: ENABLE_DOCS
+        value: "false"
+      # For the future frontend, add in the dashboard: CORS_ORIGINS=https://your-frontend.example
+      # (comma-separated). Unset = no browser origins allowed.
+
+      # --- memory: the embedding model alone takes ~560 MB; the free instance has 512 MB.
+      - key: PATTERN_SIGNAL_ENABLED
+        value: "false"
+      - key: EMBEDDING_CACHE_DIR
+        value: .cache/fastembed

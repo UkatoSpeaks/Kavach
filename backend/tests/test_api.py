@@ -17,14 +17,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_session, get_session_factory
 from app.api.routes import analyze
+from app.core.config import get_settings
 from app.db.models import Analysis
 from app.main import create_app
+from tests.conftest import settings_for_tests
 from tests.examples import GENUINE_EXAMPLES, SCAM_EXAMPLES
 from tests.fakes import FakeSession, session_factory
 
 
 def _client_with(session: object) -> httpx.AsyncClient:
-    app = create_app()
+    settings = settings_for_tests()
+    app = create_app(settings)
+    app.dependency_overrides[get_settings] = lambda: settings
 
     async def override() -> AsyncIterator[object]:
         yield session

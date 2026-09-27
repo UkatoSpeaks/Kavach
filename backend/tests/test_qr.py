@@ -115,7 +115,7 @@ async def test_qr_errors(make_client: ClientFactory, content: bytes, status: int
     async with make_client() as client:
         resp = await client.post("/analyze/qr", files={"image": ("x.png", content, "image/png")})
     assert resp.status_code == status
-    assert resp.json()["detail"]
+    assert resp.json()["error"]["message"]
 
 
 async def test_qr_requires_file(make_client: ClientFactory) -> None:
