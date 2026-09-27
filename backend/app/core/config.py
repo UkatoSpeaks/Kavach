@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import quote, unquote
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
@@ -48,10 +48,33 @@ class Settings(BaseSettings):
     # Must match the embedding model's output size. Changing it needs a migration.
     EMBEDDING_DIM: int = 384
 
+    # Scoring. Relative weight of each signal in the final score; signals that are missing
+    # for a request are skipped and the remaining weights renormalize to 1. Override in
+    # .env as JSON, e.g. SIGNAL_WEIGHTS='{"rules": 0.5, "classifier": 0.5}'.
+    SIGNAL_WEIGHTS: dict[str, float] = {
+        "rules": 0.30,
+        "classifier": 0.25,
+        "url_intel": 0.15,
+        "reputation": 0.10,
+        "pattern_similarity": 0.05,
+        "llm": 0.15,
+    }
+    # risk_score < SUSPICIOUS_MIN -> safe; < SCAM_MIN -> suspicious; else scam.
+    VERDICT_SUSPICIOUS_MIN: int = 35
+    VERDICT_SCAM_MIN: int = 70
+    # A single rule at least this strong makes the verdict at least "suspicious".
+    STRONG_RULE_WEIGHT: float = 0.8
+
     @field_validator("DATABASE_URL")
     @classmethod
     def _async_driver(cls, v: str) -> str:
         return _normalize_database_url(v)
+
+    @model_validator(mode="after")
+    def _thresholds_ordered(self) -> "Settings":
+        if not 0 < self.VERDICT_SUSPICIOUS_MIN < self.VERDICT_SCAM_MIN <= 100:
+            raise ValueError("need 0 < VERDICT_SUSPICIOUS_MIN < VERDICT_SCAM_MIN <= 100")
+        return self
 
     @field_validator("LOG_LEVEL")
     @classmethod

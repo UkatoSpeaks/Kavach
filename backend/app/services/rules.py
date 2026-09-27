@@ -1,0 +1,646 @@
+"""Weighted rule engine. Rules are data: an id, bilingual descriptions, a scam type, a weight
+and a pure check function (normalized_text, entities) -> evidence | None.
+
+Phrase lists cover English, Hinglish and Devanagari and are matched against
+ExtractedEntities.normalized_text (lower-cased, NFKC, invisible characters removed).
+Most text rules look for two phrase groups within a small window of clauses, so
+"PIN" in one message and "receive" three paragraphs later does not count.
+"""
+
+import math
+import re
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
+
+from app.core.enums import ScamType
+from app.schemas.entities import ExtractedEntities, ExtractedURL
+
+Check = Callable[[str, ExtractedEntities], str | None]
+
+
+@dataclass(frozen=True)
+class Rule:
+    id: str
+    description_en: str
+    description_hi: str
+    scam_type: ScamType
+    weight: float
+    check: Check
+
+
+@dataclass(frozen=True)
+class RuleHit:
+    rule: Rule
+    evidence: str
+
+
+@dataclass(frozen=True)
+class RuleResult:
+    hits: list[RuleHit]
+    score: int  # 0-100
+    scam_type: ScamType | None
+    type_weights: dict[ScamType, float] = field(default_factory=dict)
+
+    @property
+    def max_weight(self) -> float:
+        return max((h.rule.weight for h in self.hits), default=0.0)
+
+
+# =========================================================================== phrase lists
+# Regex fragments. \b only works for ASCII here: Python's \w does not match Devanagari
+# vowel signs, so Devanagari phrases are plain substrings.
+
+RECEIVE_MONEY = [
+    r"\breceiv\w*", r"\bcredit(?:ed)?\b", r"\bclaim\w*",
+    r"\bget (?:the |your )?(?:money|payment|amount|cashback|refund|prize|reward)",
+    r"\bpaise? (?:lene|paane|milenge|milega|aayenge|aa jayenge)", r"\bmil(?:ega|enge|egi)\b",
+    r"\baa jaye?(?:nge|ga|gi)\b", r"\bpaane\b",
+    "प्राप्त", "मिलेंगे", "मिलेगा", "मिलेगी", "पाने के लिए", "आ जाएंगे", "आ जाएगा",
+]  # fmt: skip
+PIN_WORDS = [r"\bupi[\s-]?pin\b", r"\bm[\s-]?pin\b", r"\bpin\b(?![\s-]?code)", "पिन"]
+# Awareness phrasing ("you never need a PIN to receive money") must not trigger.
+PIN_NEGATION = [
+    r"\bnever\b", r"\bno need\b", r"\b(?:do|does)(?: not|n't) need\b",
+    r"\bnot (?:required|needed|necessary)\b", r"\bzaru?rat nahi", r"\bnahi (?:chahiye|lagta)",
+    "ज़रूरत नहीं", "जरूरत नहीं", "कभी नहीं", "आवश्यकता नहीं",
+]  # fmt: skip
+SCAN = [r"\bscan\w*", "स्कैन"]
+QR = [r"\bqr\b", r"\bq\.r\.", r"\bbarcode\b", "क्यूआर"]
+QR_BAIT = [
+    r"\breceiv\w*", r"\brefund\w*", r"\badvance\b", r"\bcashback\b", r"\btoken (?:amount|money)",
+    r"\bpayment (?:received|credited)", r"\bget (?:the |your )?(?:money|payment|amount)",
+    r"\baa jaye?(?:nge|ga|gi)\b", r"\bmil(?:ega|enge|egi)\b",
+    "प्राप्त", "रिफंड", "एडवांस", "मिलेंगे", "आ जाएंगे",
+]  # fmt: skip
+PRIZE = [
+    r"\bwon\b", r"\bwinner\b", r"\bprize\b", r"\bcashback\b", r"\breward\w*", r"\blottery\b",
+    r"\blucky draw\b", r"\bjackpot\b", r"\bina+m\b", r"\bjeet\w*",
+    "इनाम", "पुरस्कार", "लॉटरी", "कैशबैक", "जीत",
+]  # fmt: skip
+COLLECT_REQUEST = [
+    r"\bcollect request\b", r"\bpayment request\b", r"\bmoney request\b", r"\brequest money\b",
+    r"\b(?:accept|approve) (?:the |this |my )?(?:payment )?request\b",
+    r"\brequest (?:sent|bheji|accept|approve)\w*", "रिक्वेस्ट",
+]  # fmt: skip
+SENT_BY_MISTAKE = [
+    r"\bby mistake\b", r"\bmistakenly\b", r"\bwrongly (?:sent|transferred|credited)",
+    r"\baccidentally (?:sent|transferred)", r"\bsent (?:it )?to (?:the )?wrong (?:number|account)",
+    r"\bgal[a]?ti se\b", r"\bgalat (?:number|account|khate)", "गलती से", "ग़लती से",
+]  # fmt: skip
+RETURN_MONEY = [
+    r"\breturn (?:it|the money|the amount|my money)", r"\bsend (?:it|the money|them) back\b",
+    r"\bpay (?:it )?back\b", r"\brefund (?:it|the amount|me)\b",
+    r"\bwapas (?:kar|bhej|de|karo|kare)\w*", r"\bwaapas\b", r"\blauta\w*",
+    "वापस कर", "वापस भेज", "वापस दे", "लौटा",
+]  # fmt: skip
+ACCOUNT_BLOCKED = [
+    r"\b(?:account|a/c|acct|khata|card|sim|yono|net ?banking|wallet|upi)\b(?:\W+\w+){0,4}?"
+    r"\W+(?:blocked|block ho\w*|suspended|deactivated|frozen|freezed|band ho\w*|band kar\w*"
+    r"|will be closed)\b",
+    r"\bkyc\b(?:\W+\w+){0,3}?\W+(?:expired|expires?|expiry|pending|incomplete|not updated"
+    r"|blocked|suspended)\b",
+    r"\b(?:kyc|pan|aadhaa?r)\b(?:\W+\w+){0,2}?\W+(?:update|link)"
+    r" (?:karein|karo|kare|now|immediately|today)",
+    r"खाता(?:\s+\S+){0,3}?\s+(?:बंद|ब्लॉक|निलंबित)",
+    r"केवाईसी(?:\s+\S+){0,3}?\s+(?:समाप्त|अपडेट|लंबित)",
+]  # fmt: skip
+ELECTRICITY = [
+    r"\belectricity\b", r"\bbijli\b", r"\bpower (?:supply|connection)\b",
+    r"\belectric (?:connection|supply)\b", r"\bbses\b", r"\btata power\b",
+    "बिजली", "विद्युत",
+]  # fmt: skip
+DISCONNECT = [
+    r"\bdisconnect\w*", r"\bwill be (?:cut|stopped)\b", r"\bkat (?:jaye?gi|jaye?ga|di jaye?gi)",
+    r"\bkaat (?:di|diya) jaye?(?:gi|ga)", r"\bband (?:ho|kar di) jaye?(?:gi|ga)",
+    "कट जाएगा", "कट जाएगी", "काट दी जाएगी", "काट दिया जाएगा", "बंद कर दी जाएगी", "डिस्कनेक्ट",
+]  # fmt: skip
+HELD_ITEM = [
+    r"\bparcel\b", r"\bpackage\b", r"\bshipment\b", r"\bconsignment\b", r"\bcourier\b",
+    r"\bcustoms\b", r"\be-?challan\b", r"\bchallan\b", r"\btraffic (?:fine|violation)",
+    "पार्सल", "चालान", "कूरियर",
+]  # fmt: skip
+HELD = [
+    r"\bheld\b", r"\bon hold\b", r"\bpending\b", r"\bunpaid\b", r"\bundelivered\b",
+    r"\bcould not be delivered\b", r"\bincomplete address\b", r"\bdelivery failed\b",
+    r"\brok (?:liya|diya)\b", "रोका", "लंबित", "बकाया",
+]  # fmt: skip
+FEE = [
+    r"\bfees?\b", r"\bpay\b", r"\bcharges?\b", r"\bpenalty\b", r"\bfine\b", r"\bshulk\b",
+    "शुल्क", "भुगतान", "जुर्माना",
+]  # fmt: skip
+URGENCY = [
+    r"\bwithin \d+ ?(?:hours?|hrs?|minutes?|mins?|days?)\b",
+    r"\b(?:in|valid for|only) \d+ ?(?:hours?|hrs?)\b", r"\b\d+ ?(?:hours?|hrs?) only\b",
+    r"\blast (?:warning|chance|reminder)\b", r"\bfinal (?:notice|warning)\b",
+    r"\bimmediately\b", r"\burgent(?:ly)?\b", r"\btonight\b", r"\btoday itself\b",
+    r"\bturant\b", r"\bjaldi\b", r"\baaj raat\b", r"\baaj hi\b",
+    "तुरंत", "आज रात", "जल्दी", "अंतिम चेतावनी", "24 घंटे",
+]  # fmt: skip
+EARN = [
+    r"\bearn\w*", r"\bincome\b", r"\bsalary\b", r"\bpayout\b", r"\bkamai\b",
+    r"\bkama(?:o|ye|yein|ein|iye)\b", r"\bpaise kamaye?",
+    "कमाएं", "कमाई", "कमाइए", "कमाओ", "कमाए",
+]  # fmt: skip
+PER_TASK = [
+    r"\bper (?:day|like|review|task|video|hour|rating|order)\b", r"\bdaily\b", r"/day\b",
+    r"\ba day\b", r"\broz(?:ana)?\b", r"\bhar din\b",
+    r"\blik(?:e|ing) (?:youtube |yt |instagram )?(?:videos?|posts?)", r"\bvideos? like\b",
+    r"\brat(?:e|ing) (?:hotels?|restaurants?|products?|movies?)", r"\bgoogle reviews?\b",
+    "प्रतिदिन", "रोज़", "रोज", "हर दिन",
+]  # fmt: skip
+PART_TIME = [
+    r"\bpart[\s-]?time\b", r"\bwork from home\b", r"\bwfh\b", r"\bghar baithe\b",
+    r"\bhome based (?:job|work)\b", "घर बैठे", "पार्ट टाइम",
+]  # fmt: skip
+JOB_WORDS = [
+    r"\bjobs?\b", r"\bhiring\b", r"\btasks?\b", r"\bpart[\s-]?time\b", r"\bearn\w*",
+    r"\bsalary\b", r"\bhr\b", r"\bnaukri\b", r"\bvacanc(?:y|ies)\b", r"\brecruit\w*",
+    r"\bwork from home\b", "नौकरी", "भर्ती",
+]  # fmt: skip
+PREPAID_TASK = [
+    r"\bprepaid tasks?\b", r"\b(?:recharge|deposit|pay|invest)\w* (?:\S+ ){0,4}?to unlock\b",
+    r"\bunlock (?:the |your )?(?:next |vip |premium )?(?:task|level|earning|commission)",
+    r"\bmerchant tasks?\b", r"\bvip tasks?\b", r"\btask (?:unlock|recharge)\b",
+    r"\bcommission (?:task|order)s?\b",
+]  # fmt: skip
+CARE_WORDS = [
+    r"\bcustomer (?:care|support|service)\b", r"\bhelp ?line\b", r"\bhelp ?desk\b",
+    r"\btoll[\s-]?free\b", r"\brefund\w*", r"\bcomplaint\b", r"\bofficer\b", r"\bexecutive\b",
+    r"\badhikari\b", r"\bsampark\b", r"\bsupport team\b",
+    "कस्टमर केयर", "हेल्पलाइन", "शिकायत", "रिफंड", "अधिकारी",
+]  # fmt: skip
+CREDENTIALS = [
+    r"\botps?\b", r"\bo\.t\.p\b", r"\bupi[\s-]?pin\b", r"\bm[\s-]?pin\b",
+    r"\bpin\b(?![\s-]?code)", r"\bcvv\b", r"\bpass(?:word|code)s?\b", r"\bverification code\b",
+    r"\bcard (?:number|details)\b",
+    "ओटीपी", "पिन", "पासवर्ड", "सीवीवी",
+]  # fmt: skip
+SHARE_VERBS = [
+    # not "confirm"/"enter": genuine SMS say "OTP to confirm your txn is 123456"
+    r"\b(?:share|send|tell|give|provide|forward|disclose|reply with)\b",
+    r"\bbata(?:o|do|dein|dijiye|iye|ye|yein|na)?\b", r"\bbhej(?:o|do|iye|ein|dijiye)?\b",
+    r"\bde do\b", r"\bdedo\b", r"\bdijiye\b", r"\bbol(?:o| do)\b", r"\blikh(?:o| do)\b",
+    "बताएं", "बताएँ", "बताइए", "बताओ", "बता दें", "भेजें", "भेजो", "शेयर करें", "शेयर करो",
+    "दीजिए", "बोलें",
+]  # fmt: skip
+# "Do not share your OTP" is what genuine bank SMS say; it must not count as a request.
+NEGATED_SHARE = [
+    r"\b(?:do not|don't|dont|never|not to|must not|should not|shouldn't)\s+(?:\w+\s+){0,4}?"
+    r"(?:share|send|tell|disclose|give|reveal|provide|forward)",
+    r"\b(?:share|bata\w*|bhej\w*|de|dein|do|karein)\s+(?:\w+\s+){0,2}?(?:na|mat|nahi|nahin)\b",
+    r"\b(?:na|mat|kabhi (?:bhi )?nahi?n?)\s+(?:\w+\s+)?(?:share|bata\w*|bhej\w*|de\w*)",
+    r"(?:न|ना|मत)\s+(?:करें|बताएं|बताएँ|बताइए|बताओ|भेजें|दें)", r"(?:शेयर|साझा)\s+(?:न|ना|मत)",
+    r"\bnever (?:ask|call)s?\b",
+]  # fmt: skip
+ID_DOCS = [r"\baadhaa?r\b", r"\badhaa?r\b", r"\bpan\b", "आधार", "पैन"]
+DOC_VERBS = SHARE_VERBS + [r"\bupload\b", r"\bupdate\b", r"\bsubmit\b", r"\bverify\b", "अपडेट"]
+
+# Messaging links used to move job-scam victims into Telegram/WhatsApp groups.
+MESSAGING_DOMAINS = frozenset({"t.me", "telegram.me", "wa.me", "whatsapp.com", "wa.link"})
+SUSPICIOUS_TLDS = frozenset(
+    {"xyz", "top", "click", "icu", "buzz", "shop", "live", "online", "site", "tk", "ml", "ga",
+     "cf", "gq", "cyou", "sbs", "cfd", "bond", "vip", "win", "loan", "rest", "quest"}
+)  # fmt: skip
+
+# Brands scammers impersonate -> the registered domains they actually use. A URL that
+# contains a brand token (or a near-miss like "paytrn", "amaz0n") on any other domain is a
+# lookalike. Official domains are allowed.
+BRAND_OFFICIAL_DOMAINS: dict[str, frozenset[str]] = {
+    brand: frozenset(domains)
+    for brand, domains in {
+        "sbi": {"sbi.co.in", "onlinesbi.sbi", "onlinesbi.com", "sbicard.com", "sbilife.co.in",
+                "sbimf.com", "sbigeneral.in", "sbisecurities.in", "yonobusiness.sbi"},
+        "yono": {"sbi.co.in", "onlinesbi.sbi", "yonobusiness.sbi", "sbiyono.sbi"},
+        "hdfc": {"hdfcbank.com", "hdfc.com", "hdfclife.com", "hdfcergo.com", "hdfcsec.com",
+                 "hdfcfund.com", "hdfcbank.net"},
+        "icici": {"icicibank.com", "icicidirect.com", "iciciprulife.com", "icicilombard.com"},
+        "axis": {"axisbank.com", "axisdirect.in", "axismf.com"},
+        "kotak": {"kotak.com", "kotaksecurities.com", "kotakmf.com", "kotaklife.com"},
+        "pnb": {"pnbindia.in", "netpnb.com", "pnbcard.in"},
+        "paytm": {"paytm.com", "paytm.in", "paytmbank.com", "paytmmoney.com", "paytm.me"},
+        "phonepe": {"phonepe.com"},
+        "gpay": {"google.com", "goo.gl"},
+        "googlepay": {"google.com"},
+        "npci": {"npci.org.in"},
+        "bhim": {"bhimupi.org.in", "npci.org.in"},
+        "rbi": {"rbi.org.in"},
+        "indiapost": {"indiapost.gov.in", "ippbonline.com"},
+        "bses": {"bsesdelhi.com"},
+        "tatapower": {"tatapower.com", "tatapower-ddl.com"},
+        "parivahan": {"parivahan.gov.in"},
+        "echallan": {"parivahan.gov.in"},
+        "amazon": {"amazon.in", "amazon.com", "amzn.in", "amzn.to", "amazonaws.com",
+                   "amazonpay.in", "media-amazon.com"},
+        "flipkart": {"flipkart.com", "fkrt.it", "fkrt.co"},
+        "bluedart": {"bluedart.com"},
+        "delhivery": {"delhivery.com"},
+        "fedex": {"fedex.com"},
+    }.items()
+}  # fmt: skip
+# Brands that are also ordinary words one typo away ("delivery") only match exactly.
+NO_FUZZY_BRANDS = frozenset({"delhivery"})
+# Only government bodies / banks can register these, so they are never lookalikes.
+RESTRICTED_SUFFIXES = (".gov.in", ".nic.in", ".bank.in", ".fin.in", ".mil.in", ".sbi")
+
+
+# =========================================================================== helpers
+
+
+def _rx(patterns: Iterable[str]) -> re.Pattern[str]:
+    return re.compile("|".join(f"(?:{p})" for p in patterns), re.IGNORECASE)
+
+
+_RX_CACHE: dict[int, re.Pattern[str]] = {}
+
+
+def _compiled(patterns: list[str]) -> re.Pattern[str]:
+    key = id(patterns)
+    if key not in _RX_CACHE:
+        _RX_CACHE[key] = _rx(patterns)
+    return _RX_CACHE[key]
+
+
+# Clause boundaries: sentence punctuation. A "." only ends a clause before whitespace or
+# the end, so "3,250.00", "Rs.500" and URLs like "sbi-kyc.xyz/login" stay whole.
+_CLAUSE_SPLIT = re.compile(r"[!?।\n]+|\.(?=\s|$)")
+_EVIDENCE_MAX = 160
+
+
+def _clauses(text: str) -> list[str]:
+    return [c.strip() for c in _CLAUSE_SPLIT.split(text) if c.strip()]
+
+
+def _snippet(text: str) -> str:
+    text = text.strip()
+    return text if len(text) <= _EVIDENCE_MAX else text[: _EVIDENCE_MAX - 1] + "…"
+
+
+def _find(text: str, patterns: list[str]) -> str | None:
+    m = _compiled(patterns).search(text)
+    return m.group(0) if m else None
+
+
+def _near(
+    text: str,
+    *groups: list[str],
+    window: int = 2,
+    unless: list[str] | None = None,
+) -> str | None:
+    """Evidence if every phrase group matches within `window` consecutive clauses.
+
+    `unless`: skip a window if the clause holding the first group's match also matches
+    one of these (e.g. "do not share" next to "OTP").
+    """
+    clauses = _clauses(text)
+    for i in range(len(clauses)):
+        chunk_clauses = clauses[i : i + window]
+        chunk = " . ".join(chunk_clauses)
+        if not all(_compiled(g).search(chunk) for g in groups):
+            continue
+        if unless is not None:
+            anchor = next((c for c in chunk_clauses if _compiled(groups[0]).search(c)), chunk)
+            if _compiled(unless).search(anchor):
+                continue
+        return _snippet(chunk)
+    return None
+
+
+def _tld(url: ExtractedURL) -> str:
+    return url.host.rsplit(".", 1)[-1]
+
+
+# Leetspeak / homoglyph folding for domain tokens: amaz0n -> amazon, paytrn -> paytm.
+_LEET = str.maketrans({"0": "o", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s"})
+
+
+def _fold(token: str) -> set[str]:
+    base = token.translate(_LEET).replace("rn", "m").replace("vv", "w")
+    return {base.replace("1", "l"), base.replace("1", "i")}
+
+
+def _edit_distance_le1(a: str, b: str) -> bool:
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        return sum(x != y for x, y in zip(a, b, strict=True)) <= 1
+    if len(a) > len(b):
+        a, b = b, a
+    return any(a == b[:i] + b[i + 1 :] for i in range(len(b)))
+
+
+def _is_official(url: ExtractedURL, domains: frozenset[str]) -> bool:
+    return url.registered_domain in domains
+
+
+def _brand_in_host(host: str, suffix_labels: int) -> str | None:
+    """Return the impersonated brand if any host label looks like one."""
+    labels = host.split(".")[: -suffix_labels or None]
+    tokens = {t for label in labels for t in re.split(r"[-_]", label) if t}
+    tokens |= {label.replace("-", "") for label in labels}  # "e-challan" -> "echallan"
+    for raw_token in tokens:
+        for token in _fold(raw_token):
+            for brand in BRAND_OFFICIAL_DOMAINS:
+                if len(brand) <= 4:  # short brands (sbi, rbi, axis): whole token or prefix
+                    if token == brand or token.startswith(brand):
+                        return brand
+                elif brand in token or (
+                    brand not in NO_FUZZY_BRANDS
+                    and len(token) >= 5
+                    and _edit_distance_le1(token, brand)
+                ):
+                    return brand
+    return None
+
+
+def _lookalike(url: ExtractedURL) -> str | None:
+    if url.is_ip or url.registered_domain.endswith(RESTRICTED_SUFFIXES):
+        return None
+    if ("." + url.host).endswith(RESTRICTED_SUFFIXES):
+        return None
+    suffix_labels = url.registered_domain.count(".")  # labels after the brand-able part
+    brand = _brand_in_host(url.host, suffix_labels)
+    if brand and not _is_official(url, BRAND_OFFICIAL_DOMAINS[brand]):
+        return brand
+    return None
+
+
+def _all_links_official(entities: ExtractedEntities) -> bool:
+    return bool(entities.urls) and all(
+        u.registered_domain.endswith(RESTRICTED_SUFFIXES)
+        or any(u.registered_domain in d for d in BRAND_OFFICIAL_DOMAINS.values())
+        for u in entities.urls
+    )
+
+
+def _mobile_numbers(entities: ExtractedEntities) -> list[str]:
+    return [p.raw for p in entities.phones if p.kind == "mobile"]
+
+
+def _has_upi(entities: ExtractedEntities) -> bool:
+    return bool(entities.upi_ids or entities.upi_uris)
+
+
+# =========================================================================== checks
+
+
+def _pin_to_receive(text: str, e: ExtractedEntities) -> str | None:
+    hit = _near(text, PIN_WORDS, RECEIVE_MONEY)
+    if hit and not _find(hit, PIN_NEGATION):
+        return hit
+    return None
+
+
+def _scan_to_receive(text: str, e: ExtractedEntities) -> str | None:
+    return _near(text, SCAN, RECEIVE_MONEY, unless=PIN_NEGATION)
+
+
+def _prize_with_upi(text: str, e: ExtractedEntities) -> str | None:
+    prize = _find(text, PRIZE)
+    if prize and _has_upi(e):
+        target = e.upi_ids[0].value if e.upi_ids else e.upi_uris[0].raw
+        return _snippet(f"{prize} … {target}")
+    return None
+
+
+def _collect_request(text: str, e: ExtractedEntities) -> str | None:
+    return _find(text, COLLECT_REQUEST)
+
+
+def _scan_qr_bait(text: str, e: ExtractedEntities) -> str | None:
+    return _near(text, QR, QR_BAIT)
+
+
+def _upi_uri_with_amount(text: str, e: ExtractedEntities) -> str | None:
+    for uri in e.upi_uris:
+        if uri.am and uri.am > 0:
+            return f"upi:// link pre-filled with amount {uri.am:g} (payee {uri.pa})"
+    return None
+
+
+def _payee_name_mismatch(text: str, e: ExtractedEntities) -> str | None:
+    for uri in e.upi_uris:
+        if not uri.pn or not uri.pa or "@" not in uri.pa:
+            continue
+        local = re.sub(r"[^a-z]", "", uri.pa.split("@", 1)[0])
+        if len(local) < 3:  # phone-number VPAs can't be compared with a name
+            continue
+        names = re.findall(r"[a-z]{3,}", uri.pn.lower())
+        if names and not any(w in local for w in names):
+            return f"payee name '{uri.pn}' vs UPI ID '{uri.pa}'"
+    return None
+
+
+def _sent_by_mistake(text: str, e: ExtractedEntities) -> str | None:
+    phrase = _find(text, SENT_BY_MISTAKE)
+    if phrase and (e.amounts or e.upi_ids):
+        return _near(text, SENT_BY_MISTAKE, window=1) or phrase
+    return None
+
+
+def _return_money(text: str, e: ExtractedEntities) -> str | None:
+    return _find(text, RETURN_MONEY)
+
+
+def _short_url(text: str, e: ExtractedEntities) -> str | None:
+    return next((u.raw for u in e.urls if u.is_shortener), None)
+
+
+def _lookalike_domain(text: str, e: ExtractedEntities) -> str | None:
+    for url in e.urls:
+        brand = _lookalike(url)
+        if brand:
+            return f"{url.host} (imitates '{brand}')"
+    return None
+
+
+def _suspicious_tld(text: str, e: ExtractedEntities) -> str | None:
+    return next((u.raw for u in e.urls if _tld(u) in SUSPICIOUS_TLDS), None)
+
+
+def _account_blocked(text: str, e: ExtractedEntities) -> str | None:
+    return _find(text, ACCOUNT_BLOCKED)
+
+
+def _electricity_disconnection(text: str, e: ExtractedEntities) -> str | None:
+    return _near(text, ELECTRICITY, DISCONNECT)
+
+
+def _fee_to_release(text: str, e: ExtractedEntities) -> str | None:
+    if _all_links_official(e):
+        return None
+    return _near(text, HELD_ITEM, HELD, FEE, window=3)
+
+
+def _urgency(text: str, e: ExtractedEntities) -> str | None:
+    return _find(text, URGENCY)
+
+
+def _earn_per_task(text: str, e: ExtractedEntities) -> str | None:
+    return _near(text, EARN, PER_TASK)
+
+
+def _part_time_high_pay(text: str, e: ExtractedEntities) -> str | None:
+    phrase = _find(text, PART_TIME)
+    big = [a for a in e.amounts if a.value >= 1000]
+    if phrase and big:
+        return f"{phrase} … {big[0].raw}"
+    return None
+
+
+def _messaging_link_job(text: str, e: ExtractedEntities) -> str | None:
+    link = next((u.raw for u in e.urls if u.registered_domain in MESSAGING_DOMAINS), None)
+    if link and _find(text, JOB_WORDS):
+        return link
+    return None
+
+
+def _prepaid_task(text: str, e: ExtractedEntities) -> str | None:
+    return _find(text, PREPAID_TASK)
+
+
+def _remote_access_app(text: str, e: ExtractedEntities) -> str | None:
+    return ", ".join(e.remote_access_apps) or None
+
+
+def _apk_link(text: str, e: ExtractedEntities) -> str | None:
+    return next(iter(e.apk_links or e.apk_files), None)
+
+
+def _helpline_personal_mobile(text: str, e: ExtractedEntities) -> str | None:
+    mobiles = _mobile_numbers(e)
+    care = _find(text, CARE_WORDS)
+    if mobiles and care:
+        return f"{care} … {mobiles[0]}"
+    return None
+
+
+def _credential_request(text: str, e: ExtractedEntities) -> str | None:
+    return _near(text, CREDENTIALS, SHARE_VERBS, window=1, unless=NEGATED_SHARE)
+
+
+def _id_document_request(text: str, e: ExtractedEntities) -> str | None:
+    return _near(text, ID_DOCS, DOC_VERBS, window=1, unless=NEGATED_SHARE)
+
+
+# =========================================================================== the rules
+
+T = ScamType
+RULES: tuple[Rule, ...] = (
+    # --- receive-money UPI scam
+    Rule("pin_to_receive", "Asks you to enter your UPI PIN to receive money",
+         "पैसे पाने के लिए UPI पिन डालने को कहा गया है", T.UPI_RECEIVE_MONEY, 0.9,
+         _pin_to_receive),
+    Rule("scan_to_receive", "Asks you to scan something to receive money",
+         "पैसे पाने के लिए स्कैन करने को कहा गया है", T.UPI_RECEIVE_MONEY, 0.6,
+         _scan_to_receive),
+    Rule("prize_with_upi", "Promises a prize, cashback or reward and gives a UPI ID",
+         "इनाम या कैशबैक का लालच और साथ में UPI आईडी", T.UPI_RECEIVE_MONEY, 0.5,
+         _prize_with_upi),
+    Rule("collect_request", "Mentions a UPI collect/payment request to accept",
+         "UPI पेमेंट रिक्वेस्ट स्वीकार करने को कहा गया है", T.UPI_RECEIVE_MONEY, 0.45,
+         _collect_request),
+    # --- QR scam
+    Rule("scan_qr_bait", "Asks you to scan a QR code to get a refund, advance or payment",
+         "रिफंड या एडवांस पाने के लिए QR कोड स्कैन करने को कहा गया है", T.QR_CODE, 0.75,
+         _scan_qr_bait),
+    Rule("upi_uri_with_amount", "Contains a UPI payment link with the amount already filled in",
+         "UPI पेमेंट लिंक में रकम पहले से भरी हुई है", T.QR_CODE, 0.3, _upi_uri_with_amount),
+    Rule("payee_name_mismatch", "The payee name does not match the UPI ID",
+         "पाने वाले का नाम UPI आईडी से मेल नहीं खाता", T.QR_CODE, 0.35, _payee_name_mismatch),
+    # --- sent-by-mistake refund
+    Rule("sent_by_mistake", "Claims money was sent to you by mistake",
+         "दावा किया गया है कि पैसे गलती से आपको भेजे गए", T.SENT_BY_MISTAKE, 0.6,
+         _sent_by_mistake),
+    Rule("return_money", "Asks you to send money back",
+         "पैसे वापस भेजने को कहा गया है", T.SENT_BY_MISTAKE, 0.45, _return_money),
+    # --- phishing links / fake notices
+    Rule("short_url", "Uses a shortened link that hides the real website",
+         "छोटा (शॉर्ट) लिंक है जो असली वेबसाइट छुपाता है", T.PHISHING_LINK, 0.45, _short_url),
+    Rule("lookalike_domain", "Link imitates a bank, brand or government website",
+         "लिंक किसी बैंक, कंपनी या सरकारी वेबसाइट की नकल है", T.PHISHING_LINK, 0.6,
+         _lookalike_domain),
+    Rule("suspicious_tld", "Link uses a cheap domain ending often used by scammers",
+         "लिंक का डोमेन (जैसे .xyz, .top) अक्सर ठग इस्तेमाल करते हैं", T.PHISHING_LINK, 0.3,
+         _suspicious_tld),
+    Rule("account_blocked", "Threatens that your account, card or KYC is blocked or expiring",
+         "खाता, कार्ड या KYC बंद होने की धमकी दी गई है", T.PHISHING_LINK, 0.45,
+         _account_blocked),
+    Rule("electricity_disconnection", "Threatens to disconnect your electricity",
+         "बिजली कनेक्शन काटने की धमकी दी गई है", T.PHISHING_LINK, 0.55,
+         _electricity_disconnection),
+    Rule("fee_to_release", "Asks for a fee to release a parcel or clear a pending challan",
+         "पार्सल छुड़ाने या चालान के लिए शुल्क मांगा गया है", T.PHISHING_LINK, 0.5,
+         _fee_to_release),
+    Rule("urgency", "Pressures you to act immediately",
+         "तुरंत कुछ करने का दबाव बनाया गया है", T.PHISHING_LINK, 0.3, _urgency),
+    # --- task-based job scam
+    Rule("earn_per_task", "Offers money per like, review, task or day",
+         "हर लाइक, रिव्यू, टास्क या दिन के हिसाब से कमाई का वादा", T.TASK_JOB, 0.5,
+         _earn_per_task),
+    Rule("part_time_high_pay", "Part-time or work-from-home job with unusually high pay",
+         "पार्ट-टाइम या घर बैठे काम के लिए बहुत ज़्यादा कमाई का वादा", T.TASK_JOB, 0.45,
+         _part_time_high_pay),
+    Rule("messaging_link_job", "Job offer that moves you to Telegram or WhatsApp",
+         "नौकरी का ऑफर जो टेलीग्राम या व्हाट्सऐप पर बुलाता है", T.TASK_JOB, 0.45,
+         _messaging_link_job),
+    Rule("prepaid_task", "Asks you to pay or recharge to unlock tasks or earnings",
+         "टास्क या कमाई अनलॉक करने के लिए पैसे जमा करने को कहा गया है", T.TASK_JOB, 0.75,
+         _prepaid_task),
+    # --- fake customer care
+    Rule("remote_access_app", "Asks you to install a screen-sharing app",
+         "स्क्रीन शेयर करने वाला ऐप (जैसे AnyDesk) इंस्टॉल करने को कहा गया है",
+         T.FAKE_CUSTOMER_CARE, 0.65, _remote_access_app),
+    Rule("apk_link", "Asks you to install an app file (.apk) from outside the Play Store",
+         "प्ले स्टोर के बाहर से ऐप फ़ाइल (.apk) इंस्टॉल करने को कहा गया है",
+         T.FAKE_CUSTOMER_CARE, 0.8, _apk_link),
+    Rule("helpline_personal_mobile", "A 'helpline' or 'officer' that is a personal mobile number",
+         "'हेल्पलाइन' या 'अधिकारी' का नंबर एक निजी मोबाइल नंबर है", T.FAKE_CUSTOMER_CARE,
+         0.4, _helpline_personal_mobile),
+    # --- generic
+    Rule("credential_request", "Asks you to share an OTP, PIN, CVV or password",
+         "OTP, पिन, CVV या पासवर्ड बताने को कहा गया है", T.GENERIC, 0.85,
+         _credential_request),
+    Rule("id_document_request", "Asks you to share or update Aadhaar/PAN details",
+         "आधार/पैन की जानकारी भेजने या अपडेट करने को कहा गया है", T.GENERIC, 0.35,
+         _id_document_request),
+)  # fmt: skip
+RULES_BY_ID = {rule.id: rule for rule in RULES}
+
+
+# =========================================================================== evaluation
+
+
+def saturating_score(weights: Iterable[float]) -> int:
+    """1 - prod(1 - w), scaled to 0-100. Each extra rule adds less than the last."""
+    return round(100 * (1 - math.prod(1 - w for w in weights)))
+
+
+def evaluate(entities: ExtractedEntities, rules: Iterable[Rule] = RULES) -> RuleResult:
+    text = entities.normalized_text
+    hits = [
+        RuleHit(rule, evidence)
+        for rule in rules
+        if (evidence := rule.check(text, entities)) is not None
+    ]
+    hits.sort(key=lambda h: h.rule.weight, reverse=True)
+
+    type_weights: dict[ScamType, float] = {}
+    for hit in hits:
+        t = hit.rule.scam_type
+        type_weights[t] = round(type_weights.get(t, 0.0) + hit.rule.weight, 4)
+
+    # Generic signs (an OTP request) fit every type; only use GENERIC if nothing else fired.
+    specific = {t: w for t, w in type_weights.items() if t is not ScamType.GENERIC}
+    pool = specific or type_weights
+    scam_type = max(pool, key=lambda t: (pool[t], _max_weight(hits, t))) if pool else None
+
+    return RuleResult(
+        hits=hits,
+        score=saturating_score(h.rule.weight for h in hits),
+        scam_type=scam_type,
+        type_weights=type_weights,
+    )
+
+
+def _max_weight(hits: list[RuleHit], scam_type: ScamType) -> float:
+    return max(h.rule.weight for h in hits if h.rule.scam_type is scam_type)

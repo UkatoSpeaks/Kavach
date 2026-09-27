@@ -1,5 +1,8 @@
 """The AnalysisResult contract returned by every analysis endpoint (see CLAUDE.md)."""
 
+from datetime import datetime
+from uuid import UUID
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.enums import Severity, Verdict
@@ -10,6 +13,7 @@ class RedFlag(BaseModel):
 
     code: str = Field(description="Stable machine id, e.g. 'otp_request', 'urgency'.")
     message: str = Field(description="Short explanation shown to the user.")
+    message_hi: str | None = Field(default=None, description="The same in simple Hindi.")
     severity: Severity = Severity.MEDIUM
     evidence: str | None = Field(
         default=None, description="The matched text/entity, e.g. the suspicious URL."
@@ -37,6 +41,8 @@ class SimilarPattern(BaseModel):
 class AnalysisResult(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+    id: UUID | None = Field(default=None, description="Set once saved; None if saving failed.")
+    created_at: datetime | None = None
     risk_score: int = Field(ge=0, le=100)
     verdict: Verdict
     scam_type: str | None = None

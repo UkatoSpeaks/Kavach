@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api.routes import health
+from app.api.routes import analyze, health
 from app.core.config import get_settings
 from app.core.logging import RequestIDMiddleware, setup_logging
 from app.db.session import create_engine, create_sessionmaker
@@ -32,6 +32,7 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Kavach", version="0.1.0", lifespan=lifespan)
     app.add_middleware(RequestIDMiddleware)
     app.include_router(health.router)
+    app.include_router(analyze.router)
     return app
 
 

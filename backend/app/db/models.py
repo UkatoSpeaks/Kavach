@@ -52,6 +52,8 @@ def _now(*, onupdate: bool = False) -> Mapped[datetime]:
 
 class Analysis(Base):
     __tablename__ = "analyses"
+    # Fetch server-generated id/created_at via RETURNING on insert.
+    __mapper_args__ = {"eager_defaults": True}
     __table_args__ = (
         _one_of("input_type", InputType, "input_type"),
         _one_of("verdict", Verdict, "verdict"),
@@ -77,6 +79,13 @@ class Analysis(Base):
     )
     explanation_en: Mapped[str | None] = mapped_column(Text)
     explanation_hi: Mapped[str | None] = mapped_column(Text)
+    advice: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    similar_patterns: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    language_hint: Mapped[str | None] = mapped_column(Text)
     # Per-layer timings, e.g. {"rules": 3, "classifier": 41, "llm": 820}.
     latency_ms: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'{}'::jsonb")

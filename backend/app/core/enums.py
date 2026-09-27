@@ -28,3 +28,15 @@ class Severity(StrEnum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
+
+
+class ScamType(StrEnum):
+    """v1 scam types. GENERIC covers signs (e.g. an OTP request) that fit any type."""
+
+    UPI_RECEIVE_MONEY = "upi_receive_money"
+    QR_CODE = "qr_code"
+    SENT_BY_MISTAKE = "sent_by_mistake"
+    PHISHING_LINK = "phishing_link"
+    TASK_JOB = "task_job"
+    FAKE_CUSTOMER_CARE = "fake_customer_care"
+    GENERIC = "generic"
