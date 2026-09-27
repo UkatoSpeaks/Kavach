@@ -75,6 +75,9 @@ class Settings(BaseSettings):
     PATTERN_FULL_MARGIN: float = 0.20
     # Scam patterns less similar than this are not listed in similar_patterns.
     PATTERN_MIN_SIMILARITY: float = 0.35
+    # Messages with fewer words than this skip the signal: a short chat line ("text me
+    # tonight") embeds close to anything. Chosen on tests/examples.py and UCI (ml/evaluate.py).
+    PATTERN_MIN_WORDS: int = 12
 
     # Real-world checks. Safe Browsing is skipped when no key is set.
     SAFE_BROWSING_API_KEY: str = ""

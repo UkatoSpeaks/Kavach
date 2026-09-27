@@ -139,6 +139,7 @@ class PatternParams:
     min_margin: float = 0.05
     full_margin: float = 0.20
     min_similarity: float = 0.35
+    min_words: int = 0  # shorter messages skip the signal
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "PatternParams":
@@ -147,6 +148,7 @@ class PatternParams:
             min_margin=settings.PATTERN_MIN_MARGIN,
             full_margin=settings.PATTERN_FULL_MARGIN,
             min_similarity=settings.PATTERN_MIN_SIMILARITY,
+            min_words=settings.PATTERN_MIN_WORDS,
         )
 
 
@@ -242,7 +244,12 @@ def pattern_signal(retrieval: Retrieval, params: PatternParams) -> SignalOutcome
     )
 
 
+SKIPPED_SHORT = "skipped: message too short for reliable similarity"
+
+
 async def pattern_similarity(text: str, search: PatternSearch) -> SignalOutcome:
+    if len(text.split()) < search.params.min_words:
+        return SignalOutcome(SOURCE, 0, SKIPPED_SHORT, informative=False)
     try:
         retrieval = await retrieve(text, search)
     except EmbeddingUnavailable as exc:

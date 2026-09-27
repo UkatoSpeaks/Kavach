@@ -94,6 +94,33 @@ async def test_unavailable_embedder_marks_signal_unavailable() -> None:
     assert out.score is None and out.detail == "embedding model is still loading"
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Aight, text me tonight and we'll see what's up",  # UCI ham, was flagged
+        "Scan karke paise receive karo",
+    ],
+)
+async def test_short_messages_skip_the_signal(text: str) -> None:
+    # UnavailableEmbedder: the skip happens before anything is embedded.
+    params = rag.PatternParams(min_words=12)
+    search = rag.PatternSearch(UnavailableEmbedder(), rag.InMemoryRetriever([]), params)
+    out = await rag.pattern_similarity(text, search)
+    assert (out.score, out.informative, out.detail) == (0, False, rag.SKIPPED_SHORT)
+
+
+async def test_messages_at_the_cutoff_are_compared() -> None:
+    search = rag.PatternSearch(UnavailableEmbedder(), rag.InMemoryRetriever([]),
+                               rag.PatternParams(min_words=12))  # fmt: skip
+    out = await rag.pattern_similarity(" ".join(["word"] * 12), search)
+    assert out.score is None  # reached the embedder
+
+
+def test_min_words_comes_from_settings() -> None:
+    settings = get_settings().model_copy(update={"PATTERN_MIN_WORDS": 7})
+    assert rag.PatternParams.from_settings(settings).min_words == 7
+
+
 # ----------------------------------------------------------------------------- retrieval
 
 

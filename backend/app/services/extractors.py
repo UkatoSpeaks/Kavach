@@ -81,6 +81,16 @@ BARE_DOMAIN_TLDS = frozenset(
         "ws", "sh", "gg", "do", "st", "ink",
     }
 )  # fmt: skip
+# Bare-domain TLDs that are also everyday English words. "Quiz.Win a prize" or "Reached
+# home.In the meantime" is a missing space after a full stop, not a link (see _missing_space).
+WORD_TLDS = frozenset(
+    {
+        "in", "me", "at", "do", "us", "one", "win", "today", "live", "life", "shop", "store",
+        "club", "fun", "work", "help", "world", "news", "money", "bank", "page", "link",
+        "click", "online", "site", "space", "support", "services", "digital", "cloud", "loan",
+        "bid", "rest", "quest", "bond", "pro", "tech", "website",
+    }
+)  # fmt: skip
 
 _DEVA = "ऀ-ॿ"
 
@@ -188,16 +198,31 @@ def registered_domain(host: str) -> str:
     return ".".join(labels[-n:])
 
 
+_SENTENCE_JOIN_RE = re.compile(r"[A-Za-z]+\.[A-Z][a-z]+")
+
+
+def _missing_space(bare: str, raw: str) -> bool:
+    """'Quiz.Win', 'home.In': a plain word, a dot, then a Capitalized everyday word, with no
+    path. 'sbi-kyc.Online', 'Bit.ly/x' and 'xyz.top' are still links."""
+    return (
+        raw == bare
+        and _SENTENCE_JOIN_RE.fullmatch(bare) is not None
+        and bare.rsplit(".", 1)[-1].lower() in WORD_TLDS
+    )
+
+
 def extract_urls(text: str) -> list[ExtractedURL]:
     text = clean_text(text)
     urls: list[ExtractedURL] = []
     for m in _URL_RE.finditer(text):
         scheme = m.group("scheme")
         host = (m.group("host") or m.group("bare")).lower()
+        raw = _strip_trailing_punct(m.group(0))
         if not scheme and not host.startswith("www."):
             if host.rsplit(".", 1)[-1] not in BARE_DOMAIN_TLDS:
                 continue
-        raw = _strip_trailing_punct(m.group(0))
+            if _missing_space(m.group("bare"), raw):
+                continue
         rest = raw[len(scheme or "") + len(host) :]  # port + path, original case kept
         url = f"{(scheme or 'http://').lower()}{host}{rest}"
         domain = registered_domain(host)

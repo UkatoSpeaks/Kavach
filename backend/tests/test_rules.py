@@ -45,8 +45,12 @@ CASES: dict[str, tuple[str, str]] = {
         "Sorry, sent that photo by mistake",
     ),
     "return_money": (
-        "Please wapas kar do bhai",
-        "I'll return the book on Monday",
+        "Galti se ₹3,000 bhej diye. Please wapas kar do bhai",
+        "Sent that photo by mistake. Return the book immediately",
+    ),
+    "money_back_request": (
+        "Please send the money back to my account",
+        "I'll pay back the loan next month",
     ),
     "short_url": (
         "Check details at https://bit.ly/3AbCd",
@@ -216,6 +220,100 @@ def test_saturating_score() -> None:
     assert saturating_score([0.5, 0.5]) == 75
     assert saturating_score([0.5, 0.5, 0.5]) == 88
     assert saturating_score([1.0, 0.3]) == 100
+
+
+# Genuine UCI SMS (ham) that were flagged before return_money/urgency were tightened.
+UCI_RETURN_MONEY_HAM = [
+    "Maybe i could get book out tomo then return it immediately ..? Or something.",
+    "I was wondering if it would be okay for you to call uncle john and let him know that "
+    "things are not the same in nigeria as they r here. That &lt;#&gt; dollars is 2years sent "
+    "and that you know its a strain but i plan to pay back every dime he gives. Every dime so "
+    "for me to expect anything from you is not practical. Something like that.",
+    "I had been hoping i would not have to send you this message. My rent is due and i dont "
+    "have enough for it. My reserves are completely gone. Its a loan i need and was hoping you "
+    "could her. The balance is &lt;#&gt; . Is there a way i could get that from you, till mid "
+    "march when i hope to pay back.",
+    "They are just making it easy to pay back. I have &lt;#&gt; yrs to say but i can pay back "
+    "earlier. You get?",
+]
+UCI_URGENCY_HAM = [
+    "Aight, text me tonight and we'll see what's up",
+    "You please give us connection today itself before &lt;DECIMAL&gt; or refund the bill",
+]
+
+
+@pytest.mark.parametrize("text", UCI_RETURN_MONEY_HAM)
+def test_uci_pay_back_between_friends_is_not_return_money(text: str) -> None:
+    assert fires("return_money", text) is None
+    assert fires("money_back_request", text) is None
+
+
+@pytest.mark.parametrize("text", UCI_URGENCY_HAM)
+def test_uci_day_words_alone_are_not_urgency(text: str) -> None:
+    assert fires("urgency", text) is None
+
+
+@pytest.mark.parametrize("text", UCI_RETURN_MONEY_HAM + UCI_URGENCY_HAM)
+def test_uci_false_positives_score_safe_on_rules(text: str) -> None:
+    assert evaluate(extract_entities(text)).score < 35
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Return the book immediately",
+        "I'll pay back the loan",
+        "Wapas kar dena kitaab kal",
+    ],
+)
+def test_return_without_money_does_not_fire(text: str) -> None:
+    assert fires("return_money", text) is None
+    assert fires("money_back_request", text) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "I sent ₹5,000 to your number by mistake. Kindly return it on GPay.",
+        "Galti se aapke account me paise aa gaye, please wapas kar do",
+        "Wrongly credited 2000 rs to you. Pay it back to rohit.sharma@ybl",
+        "मैंने गलती से आपके खाते में ₹2000 भेज दिए हैं, कृपया वापस कर दीजिए।",
+    ],
+)
+def test_return_money_with_mistake_story_and_money(text: str) -> None:
+    assert fires("return_money", text) is not None
+    assert fires("money_back_request", text) is None
+
+
+def test_return_money_needs_money_in_the_same_or_next_clause() -> None:
+    far = "Sent ₹500 by mistake. Anyway. How are you. Kal milte hain. Please return it."
+    assert fires("return_money", far) is None
+    assert fires("return_money", "Sent ₹500 by mistake. Please return it.") is not None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Your electricity will be disconnected tonight",
+        "Your account will be blocked today",
+        "Pay the challan today to avoid penalty",
+        "Aaj raat bijli kat jayegi",
+        "Aaj payment nahi kiya toh connection band ho jayega",
+        "Complete KYC within 24 hours",
+        "Last warning: update your details",
+        "Call immediately",
+    ],
+)
+def test_urgency_still_fires(text: str) -> None:
+    assert fires("urgency", text) is not None
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["See you today", "Text me tonight", "Aaj movie chalein?", "Aaj raat party hai", "आज आओ"],
+)
+def test_day_words_alone_are_not_urgency(text: str) -> None:
+    assert fires("urgency", text) is None
 
 
 def test_evaluate_picks_heaviest_type_and_ignores_generic_when_specific() -> None:

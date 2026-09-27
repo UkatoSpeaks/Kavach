@@ -2,6 +2,7 @@
 splits, synthetic-output parsing and metrics. No files, network or Groq."""
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -63,6 +64,64 @@ def test_account_and_card_numbers_are_masked_consistently() -> None:
 def test_personal_emails_get_a_fake_local_part() -> None:
     r = anonymize_text("Mail rahul.s@gmail.com or care@sbi.co.in")
     assert "rahul.s@" not in r.text and "@gmail.com" in r.text and "care@sbi.co.in" in r.text
+
+
+@pytest.mark.parametrize(
+    ("text", "name"),
+    [
+        ("Rs 500 received from RAHUL KUMAR via UPI. Ref 412345678901", "RAHUL KUMAR"),
+        ("You have paid Rs.250 to Priya Singh on 12-09", "Priya Singh"),
+        ("INR 1,000 credited by Suresh Patel to A/c XX1234", "Suresh Patel"),
+        ("Beneficiary Name: MEENA IYER added to your account", "MEENA IYER"),
+        ("Money sent to Mr. Ramesh Gupta", "Ramesh Gupta"),
+        ("Transfer to Rahul done, ₹500", "Rahul"),  # bare "to" in an alert
+        ("Rs.5000 Credited To Your Account By NEFT From ANIL MEHTA", "ANIL MEHTA"),
+    ],
+)
+def test_names_in_bank_and_upi_alerts_are_replaced(text: str, name: str) -> None:
+    r = anonymize_text(text)
+    for word in name.split():
+        assert word not in r.text
+    assert name in r.replaced
+    fake = r.replaced[name]
+    assert (fake.upper() if name.isupper() else fake) in r.text  # ALL-CAPS stays ALL-CAPS
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Rs 642 paid to Swiggy. Order from Meghana Foods",
+        "Rs 100 received from Zomato by UPI",
+        "₹1,299 paid to Flipkart and ₹499 to BigBasket",
+        "Rs 200 debited to VPA swiggy.stores@icici. Call 18002586161 to Report",
+        "Rs 500 credited to Your Account from HDFC BANK",
+        "Meet me at the station and go to Delhi",  # no alert context: bare "to" is ignored
+    ],
+)
+def test_brands_merchants_and_ordinary_words_are_not_names(text: str) -> None:
+    assert anonymize_text(text).text == text
+
+
+def test_genuine_examples_keep_their_merchants() -> None:
+    swiggy = (
+        "Your Swiggy order #174839201756 from Meghana Foods is out for delivery. Suresh will "
+        "reach in 12 mins. Total paid: ₹642."
+    )
+    assert anonymize_text(swiggy).text == swiggy
+
+
+def test_aadhaar_and_pan_are_masked_but_transaction_ids_kept() -> None:
+    r = anonymize_text(
+        "My Aadhaar is 2345 6789 0123, again 234567890123. PAN ABCPE1234F. "
+        "UPI Ref 412345678901. UTR: 312345678901. Order no 512345678901"
+    )
+    assert "2345 6789 0123" not in r.text and "234567890123" not in r.text
+    assert "ABCPE1234F" not in r.text
+    masked = re.findall(r"XXXX XXXX \d{4}", r.text)
+    assert len(masked) == 2 and masked[0] == masked[1]  # same number -> same fake
+    assert re.search(r"\bXXXPX\d{4}X\b", r.text)  # PAN format and holder type kept
+    for ref in ("412345678901", "312345678901", "512345678901"):
+        assert ref in r.text
 
 
 # ----------------------------------------------------------------------------- language

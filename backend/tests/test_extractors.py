@@ -90,6 +90,34 @@ def test_no_false_urls(text: str) -> None:
     assert extract_urls(text) == []
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        # UCI spam: a missing space after a full stop, not the domain quiz.win
+        "Moby Pub Quiz.Win a £100 High Street prize if u know who the new Duchess of Cornwall "
+        "will be? Txt her first name to 82277.unsub STOP £1.50 008704050406 SP Arrow",
+        "Offer ends today.Call now",
+        "Reached home.In the car now",
+    ],
+)
+def test_missing_space_after_full_stop_is_not_a_url(text: str) -> None:
+    assert extract_urls(text) == []
+
+
+@pytest.mark.parametrize(
+    ("text", "url"),
+    [
+        ("Update KYC at sbi-kyc.in/verify", "http://sbi-kyc.in/verify"),
+        ("Visit xyz.top now", "http://xyz.top"),
+        ("Visit Sbi-Kyc.Online now", "http://sbi-kyc.online"),  # hyphen: a real domain
+        ("Claim at Free.Win/prize", "http://free.win/prize"),  # has a path
+        ("Claim at https://Quiz.Win", "https://quiz.win"),  # has a scheme
+    ],
+)
+def test_bare_domains_still_found(text: str, url: str) -> None:
+    assert [u.url for u in extract_urls(text)] == [url]
+
+
 def test_url_flags() -> None:
     by_host = {u.host: u for u in extract_urls("get http://10.0.0.7/a and x.xyz/app/Loan.APK")}
     assert by_host["10.0.0.7"].is_ip

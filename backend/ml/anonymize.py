@@ -11,6 +11,12 @@ What is replaced
 - The name after a greeting ("Dear Rahul", "Hi Priya Sharma", "प्रिय राहुल") -> a placeholder
   name, everywhere it appears in the message. Generic greetings ("Dear Customer", "Hi
   Sir") are left alone.
+- Names in bank/UPI alerts: "received from RAHUL KUMAR", "paid to Priya", "credited by ...",
+  "Name: ..." and, in a message that looks like a transaction alert, a bare "from/to/by
+  <Name>". Brands and merchants ("paid to Swiggy", "from Meghana Foods") are kept.
+- Aadhaar-like 12-digit numbers ("2345 6789 0123") -> "XXXX XXXX " + 4 fake digits, and PAN
+  numbers (ABCDE1234F) -> "XXX" + the 4th letter (holder type) + "X" + 4 fake digits + "X".
+  12-digit transaction references ("UPI Ref 412345678901") are kept.
 - Account and card numbers: full ones after "a/c", "account", "card" ... and masked tails
   like "XX1234" / "XXXX 1234" -> "XX" + 4 fake digits.
 - Emails at personal mail providers (gmail, yahoo, ...) -> a fake local part, same domain.
@@ -58,6 +64,66 @@ NOT_NAMES = frozenset(
     didi uncle aunty sister brother mom mummy maa papa dad beta
     """.split()
 ) | {"ग्राहक", "उपभोक्ता", "सदस्य", "महोदय", "महोदया", "मित्र", "जी", "भाई", "साथी", "ग्राहकों"}
+
+# Capitalized words after from/to/by in alerts that are not people.
+NOT_ALERT_NAMES = NOT_NAMES | frozenset(
+    """
+    the your you yours my our us me him her them his a an this that these those it its
+    upi vpa a/c ac acct account accounts bank card wallet mobile number imps neft rtgs atm pos
+    ref no not on at in for and or is of via with rs inr india self merchant ltd pvt limited
+    mr mrs ms shri smt dr
+    sbi hdfc icici axis kotak pnb bob boi canara idfc yes rbl federal indusind union baroda
+    bhim npci
+    report block know avail check update verify view pay claim get stop unsubscribe call
+    visit login activate download register continue dispute raise receive track win reply
+    click link today tomorrow
+    """.split()
+)
+# Merchants and brands a payment goes to/from: never masked.
+BRANDS = frozenset(
+    """
+    swiggy zomato amazon flipkart bigbasket myntra uber ola rapido airtel jio vodafone vi bsnl
+    irctc netflix hotstar spotify bookmyshow blinkit zepto meesho nykaa dunzo dominos
+    mcdonalds starbucks reliance dmart tata google apple paytm phonepe gpay cred makemytrip
+    goibibo ajio lenskart pharmeasy tatacliq jiomart licious instamart
+    """.split()
+)
+# A word like these makes it a business name ("Meghana Foods", "Sai Medical Store").
+BUSINESS_WORDS = frozenset(
+    """
+    foods food store stores mart restaurant restaurants enterprises enterprise traders trading
+    services bank hotel hotels cafe kitchen pharmacy medical medicals hospital electronics
+    retail solutions technologies agency agencies motors supermarket bazaar kirana general
+    industries corporation corp inc company co llp online payments fuels petroleum station shop
+    """.split()
+)
+_NAME_WORD = r"(?:[A-Z][a-z]{1,20}|[A-Z]{2,20})"
+_HONORIFIC = r"(?:(?:Mr|Mrs|Ms|Shri|Smt|Dr)\.?\s+)?"
+# "received from X", "paid to X", "Name: X": an alert on their own. Keywords any case.
+_ALERT_NAME_RE = re.compile(
+    r"(?:\b(?i:(?:received|credited|debited|paid|sent|transferred|payment|money)\s+(?:from|to|by)"
+    r"|(?:beneficiary\s+|payee\s+|sender\s+|receiver\s+|account\s+)?name\s*:)\s*)"
+    rf"{_HONORIFIC}(?P<name>{_NAME_WORD}(?:\s{_NAME_WORD}){{0,2}})\b"
+)
+# A bare "from/to/by X" only counts in a message that looks like a transaction alert.
+_BARE_NAME_RE = re.compile(
+    rf"\b(?i:from|to|by)\s+{_HONORIFIC}(?P<name>{_NAME_WORD}(?:\s{_NAME_WORD}){{0,2}})\b"
+)
+_ALERT_CONTEXT_RE = re.compile(
+    r"₹|\brs\.?\s?\d|\binr\b|\bcredited\b|\bdebited\b|\breceived\b|\bpaid\b|\bupi\b"
+    r"|\ba/c\b|\bvpa\b|\bimps\b|\bneft\b",
+    re.IGNORECASE,
+)
+# Aadhaar: 12 digits, first 2-9, optionally in groups of 4 with one kind of separator.
+_AADHAAR_RE = re.compile(r"(?<![\w/.=@-])(?P<a>[2-9]\d{3})(?P<sep>[\s-]?)(?P<b>\d{4})(?P=sep)"
+                         r"(?P<c>\d{4})(?![\w@]|\.\d)")  # fmt: skip
+# 12-digit transaction ids look the same: keep them after these words.
+_TXN_ID_BEFORE_RE = re.compile(
+    r"\b(?:upi|imps|neft|rtgs|ref|reference|utr|rrn|txn|transaction|order|awb|tracking|invoice"
+    r"|pnr|booking)\b(?:\s*(?:no|num|number|id))?\.?(?:\s+is)?\s*[:#-]?\s*$",
+    re.IGNORECASE,
+)
+_PAN_RE = re.compile(r"(?<![\w@/.=-])[A-Z]{5}\d{4}[A-Z](?![\w@])", re.IGNORECASE)
 
 # The greeting is case-insensitive; the name must be capitalized ("hi there" is no name).
 _GREETING_RE = re.compile(
@@ -157,6 +223,20 @@ class _Anonymizer:
     def _tail(self, digits: str, n: int = 4) -> str:
         return self.fake(f"acct{n}", digits[-n:], lambda i: _digits(f"{digits}/{i}", n))
 
+    # --- Aadhaar / PAN
+    def aadhaar(self, m: re.Match[str]) -> str | None:
+        if _TXN_ID_BEFORE_RE.search(self.text[max(0, m.start() - 30) : m.start()]):
+            return None
+        digits = m.group("a") + m.group("b") + m.group("c")
+        sep = m.group("sep") or " "
+        tail = self.fake("aadhaar", digits, lambda i: _digits(f"{digits}/{i}", 4))
+        return f"XXXX{sep}XXXX{sep}{tail}"
+
+    def pan(self, m: re.Match[str]) -> str:
+        pan = m.group(0).upper()
+        digits = self.fake("pan", pan, lambda i: _digits(f"{pan}/{i}", 4))
+        return f"XXX{pan[3]}X{digits}X"
+
     # --- emails at personal providers
     def email(self, m: re.Match[str]) -> str | None:
         handle = m.group("handle").lower()
@@ -179,6 +259,7 @@ class _Anonymizer:
                     continue
                 name = " ".join(words)
             found.append((name, hindi))
+        found += [(name, False) for name in self._alert_names()]
         for name, hindi in found:
             pool = FAKE_NAMES_HI if hindi else FAKE_NAMES
             two = len(name.split()) > 1
@@ -200,6 +281,26 @@ class _Anonymizer:
                 self.sub(re.compile(boundary.format(re.escape(first))),
                          lambda _m, fake=fake: fake.split()[0])  # fmt: skip
 
+    def _alert_names(self) -> list[str]:
+        """Person names in bank/UPI alert phrasing; brands and merchants are skipped."""
+        matches = list(_ALERT_NAME_RE.finditer(self.text))
+        if _ALERT_CONTEXT_RE.search(self.text):
+            matches += _BARE_NAME_RE.finditer(self.text)
+        protected = _protected_spans(self.text)
+        names = []
+        for m in matches:
+            if _overlaps(m.span("name"), protected):
+                continue
+            words = []
+            for w in m.group("name").split():
+                if w.lower() in NOT_ALERT_NAMES:
+                    break
+                words.append(w)
+            lowered = {w.lower() for w in words}
+            if words and not lowered & (BRANDS | BUSINESS_WORDS):
+                names.append(" ".join(words))
+        return names
+
     def emails(self) -> None:
         """Emails sit inside the protected name@handle spans, so they get their own pass."""
 
@@ -215,6 +316,8 @@ class _Anonymizer:
         # "A/c 123456789012 (XX9012)" becomes "A/c XX4821 (XX4821)".
         self.sub(_ACCOUNT_RE, self.account)
         self.sub(_CARD_RE, self.card)
+        self.sub(_AADHAAR_RE, self.aadhaar)
+        self.sub(_PAN_RE, self.pan)
         self.sub(_MASKED_RE, self.masked)
         self.sub(_MOBILE_RE, self.phone)
         self.emails()

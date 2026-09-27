@@ -93,6 +93,14 @@ RETURN_MONEY = [
     r"\bwapas (?:kar|bhej|de|karo|kare)\w*", r"\bwaapas\b", r"\blauta\w*",
     "वापस कर", "वापस भेज", "वापस दे", "लौटा",
 ]  # fmt: skip
+# "Return it" is only about money when money is mentioned nearby ("return the book" is not).
+# Extracted amounts and UPI IDs count too (see _money_near).
+MONEY_WORDS = [
+    "₹", r"\brs\b", r"\binr\b", r"\brupe\w*", r"\brupa\w*", r"\bpaise?\b", r"\bpaisa\b",
+    r"\bmoney\b", r"\bamount\b", r"\bpayment\b", r"\btransfer\w*", r"\bupi\b", r"\baccount\b",
+    r"\ba/c\b", r"\bkhate\b", r"\bgpay\b", r"\bphonepe\b", r"\bpaytm\b",
+    "पैसे", "पैसा", "रुपये", "रुपए", "राशि", "खाते",
+]  # fmt: skip
 ACCOUNT_BLOCKED = [
     r"\b(?:account|a/c|acct|khata|card|sim|yono|net ?banking|wallet|upi)\b(?:\W+\w+){0,4}?"
     r"\W+(?:blocked|block ho\w*|suspended|deactivated|frozen|freezed|band ho\w*|band kar\w*"
@@ -132,9 +140,18 @@ URGENCY = [
     r"\bwithin \d+ ?(?:hours?|hrs?|minutes?|mins?|days?)\b",
     r"\b(?:in|valid for|only) \d+ ?(?:hours?|hrs?)\b", r"\b\d+ ?(?:hours?|hrs?) only\b",
     r"\blast (?:warning|chance|reminder)\b", r"\bfinal (?:notice|warning)\b",
-    r"\bimmediately\b", r"\burgent(?:ly)?\b", r"\btonight\b", r"\btoday itself\b",
-    r"\bturant\b", r"\bjaldi\b", r"\baaj raat\b", r"\baaj hi\b",
-    "तुरंत", "आज रात", "जल्दी", "अंतिम चेतावनी", "24 घंटे",
+    r"\bimmediately\b", r"\burgent(?:ly)?\b", r"\bturant\b", r"\bjaldi\b",
+    "तुरंत", "जल्दी", "अंतिम चेतावनी", "24 घंटे",
+]  # fmt: skip
+# "Text me tonight" is not pressure. A day word only counts next to a threat or a payment
+# demand in the same clause ("will be disconnected tonight", "pay today").
+TIME_WORDS = [r"\btoday\b", r"\btonight\b", r"\baaj\b", "आज"]
+CONSEQUENCE = [
+    r"\bblock(?:ed)?\b", r"\bdisconnect\w*", r"\b(?:be|get|gets|getting) cut\b", r"\bcut off\b",
+    r"\bsuspend\w*", r"\bdeactivat\w*", r"\bpenalty\b", r"\blegal action\b", r"\bcourt\b",
+    r"\bband (?:ho|kar)\w*(?: \w+)? jaye?(?:ga|gi|nge)\b", r"\bkat (?:jaye?(?:ga|gi)|di)\b",
+    r"\bpay\b", r"\bpayment\b", r"\bbhugtan\b", r"\brecharge\b", r"\bdeposit\b",
+    "बंद", "कट जा", "काट दी", "ब्लॉक", "जुर्माना", "कानूनी कार्रवाई", "भुगतान",
 ]  # fmt: skip
 EARN = [
     r"\bearn\w*", r"\bincome\b", r"\bsalary\b", r"\bpayout\b", r"\bkamai\b",
@@ -455,8 +472,32 @@ def _sent_by_mistake(text: str, e: ExtractedEntities) -> str | None:
     return None
 
 
+def _money_near(text: str, e: ExtractedEntities, group: list[str]) -> str | None:
+    """Evidence if `group` matches in a clause and money is mentioned in that clause or a
+    neighbouring one (a money word, an extracted amount or a UPI ID)."""
+    clauses = _clauses(text)
+    money = [a.raw.lower() for a in e.amounts] + [u.value for u in e.upi_ids]
+    for i, clause in enumerate(clauses):
+        if not _compiled(group).search(clause):
+            continue
+        chunk = " . ".join(clauses[max(0, i - 1) : i + 2])
+        if _compiled(MONEY_WORDS).search(chunk) or any(m in chunk for m in money):
+            return _snippet(clause)
+    return None
+
+
 def _return_money(text: str, e: ExtractedEntities) -> str | None:
-    return _find(text, RETURN_MONEY)
+    if not _find(text, SENT_BY_MISTAKE):
+        return None
+    return _money_near(text, e, RETURN_MONEY)
+
+
+def _money_back_request(text: str, e: ExtractedEntities) -> str | None:
+    """The weak version of return_money: no "sent by mistake" story (friends settling a
+    loan say "I'll pay the money back" too)."""
+    if _find(text, SENT_BY_MISTAKE):
+        return None
+    return _money_near(text, e, RETURN_MONEY)
 
 
 def _short_url(text: str, e: ExtractedEntities) -> str | None:
@@ -490,7 +531,7 @@ def _fee_to_release(text: str, e: ExtractedEntities) -> str | None:
 
 
 def _urgency(text: str, e: ExtractedEntities) -> str | None:
-    return _find(text, URGENCY)
+    return _find(text, URGENCY) or _near(text, TIME_WORDS, CONSEQUENCE, window=1)
 
 
 def _earn_per_task(text: str, e: ExtractedEntities) -> str | None:
@@ -573,8 +614,11 @@ RULES: tuple[Rule, ...] = (
     Rule("sent_by_mistake", "Claims money was sent to you by mistake",
          "दावा किया गया है कि पैसे गलती से आपको भेजे गए", T.SENT_BY_MISTAKE, 0.6,
          _sent_by_mistake),
-    Rule("return_money", "Asks you to send money back",
-         "पैसे वापस भेजने को कहा गया है", T.SENT_BY_MISTAKE, 0.45, _return_money),
+    Rule("return_money", "Claims money was sent by mistake and asks you to send it back",
+         "गलती से भेजे गए पैसे वापस भेजने को कहा गया है", T.SENT_BY_MISTAKE, 0.45,
+         _return_money),
+    Rule("money_back_request", "Asks you to send money back",
+         "पैसे वापस भेजने को कहा गया है", T.SENT_BY_MISTAKE, 0.2, _money_back_request),
     # --- phishing links / fake notices
     Rule("short_url", "Uses a shortened link that hides the real website",
          "छोटा (शॉर्ट) लिंक है जो असली वेबसाइट छुपाता है", T.PHISHING_LINK, 0.45, _short_url),
