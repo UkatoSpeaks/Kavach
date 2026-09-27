@@ -37,6 +37,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             model=settings.GROQ_MODEL,
             fallback_model=settings.GROQ_FALLBACK_MODEL,
             timeout_s=settings.LLM_TIMEOUT_S,
+            reasoning_effort=settings.GROQ_REASONING_EFFORT,
             cache=LRUTTLCache(settings.LLM_CACHE_SIZE, settings.LLM_CACHE_TTL_S),
         )
         if settings.GROQ_API_KEY

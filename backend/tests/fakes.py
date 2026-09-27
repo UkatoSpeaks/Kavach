@@ -5,7 +5,8 @@ routes don't round-trip to Supabase. Real persistence is covered by the @pytest.
 import hashlib
 import re
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any
@@ -52,6 +53,16 @@ class FakeSession:
 
     def all(self, model: type) -> list[Any]:
         return [row for (m, _), row in self.rows.items() if m is model]
+
+
+def session_factory(session: Any) -> Callable[[], AbstractAsyncContextManager[Any]]:
+    """A SessionFactory that always hands out `session` (e.g. a FakeSession)."""
+
+    @asynccontextmanager
+    async def factory() -> AsyncIterator[Any]:
+        yield session
+
+    return factory
 
 
 class InMemoryReputation:

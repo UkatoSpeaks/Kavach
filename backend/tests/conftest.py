@@ -21,7 +21,7 @@ from app.services import url_intel
 from app.services.agent.llm import Reasoner
 from app.services.cache import LookupCache
 from app.services.pipeline import Checks
-from tests.fakes import FakeSession, InMemoryReputation, fake_pattern_search
+from tests.fakes import FakeSession, InMemoryReputation, fake_pattern_search, session_factory
 
 # What every hostname resolves to unless a test says otherwise (see fake_dns).
 PUBLIC_IP = "93.184.215.14"
@@ -80,7 +80,8 @@ def reputation_store() -> InMemoryReputation:
 def make_client(fake_session: FakeSession, reputation_store: InMemoryReputation) -> ClientFactory:
     """make_client(**settings_overrides) -> API client with no database behind it.
 
-    Analyses are saved to fake_session, reputation comes from reputation_store, the
+    Analyses are saved to fake_session (by the background save, which the test client
+    runs before it returns the response), reputation comes from reputation_store, the
     url_cache is in-memory (per request) and pattern retrieval runs in memory over the real
     knowledge-base docs with FakeEmbedder. The LLM step is off (reported unavailable) unless
     a test passes reasoner=, e.g. a tests.fakes.FakeReasoner; the real Groq API is never
@@ -92,6 +93,8 @@ def make_client(fake_session: FakeSession, reputation_store: InMemoryReputation)
         app = create_app()
         patterns = fake_pattern_search()
         app.dependency_overrides[get_reasoner] = lambda: reasoner
+        factory = session_factory(fake_session)
+        app.dependency_overrides[get_session_factory] = lambda: factory
 
         async def checks_override(
             client: Annotated[httpx.AsyncClient, Depends(get_http_client)],

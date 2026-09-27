@@ -1,20 +1,26 @@
 """API tests. Analyses are saved to an in-memory FakeSession; one @pytest.mark.db test
-covers the real save and read-back."""
+covers the real save and read-back.
 
+The save is a background task. httpx's ASGITransport returns the response only after the
+app has finished, background tasks included, so a test can read the row right after."""
+
+import asyncio
 import uuid
 from collections.abc import AsyncIterator
 
 import httpx
 import pytest
+from fastapi import BackgroundTasks
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_session
+from app.api.deps import get_session, get_session_factory
+from app.api.routes import analyze
 from app.db.models import Analysis
 from app.main import create_app
 from tests.examples import GENUINE_EXAMPLES, SCAM_EXAMPLES
-from tests.fakes import FakeSession
+from tests.fakes import FakeSession, session_factory
 
 
 def _client_with(session: object) -> httpx.AsyncClient:
@@ -23,7 +29,9 @@ def _client_with(session: object) -> httpx.AsyncClient:
     async def override() -> AsyncIterator[object]:
         yield session
 
+    factory = session_factory(session)
     app.dependency_overrides[get_session] = override
+    app.dependency_overrides[get_session_factory] = lambda: factory
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
 
 
@@ -124,10 +132,44 @@ class _BrokenSession:
     async def rollback(self) -> None:
         pass
 
+    async def get(self, *_: object) -> None:
+        return None  # nothing was ever stored
 
-async def test_db_down_still_returns_verdict() -> None:
-    async with _client_with(_BrokenSession()) as client:
+
+class _HangingSession(_BrokenSession):
+    async def commit(self) -> None:
+        await asyncio.sleep(3600)
+
+
+@pytest.mark.parametrize("session", [_BrokenSession(), _HangingSession()], ids=["down", "slow"])
+async def test_failed_save_still_returns_verdict_and_logs(
+    session: object, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(analyze, "DB_SAVE_TIMEOUT_S", 0.05)
+    async with _client_with(session) as client:
         resp = await client.post("/analyze/text", json={"text": SCAM_EXAMPLES[0][1]})
-    assert resp.status_code == 200
-    assert resp.json()["verdict"] == "scam"
-    assert resp.json()["id"] is None
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["verdict"] == "scam"
+        assert body["id"] is not None and body["created_at"] is not None  # generated up front
+        assert f"could not save analysis {body['id']}" in caplog.text
+        assert (await client.get(f"/analysis/{body['id']}")).status_code == 404
+
+
+async def test_save_is_a_background_task(
+    fake_session: FakeSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing is written before the response; the id returned is the one saved later."""
+    tasks: list[tuple[object, tuple[object, ...]]] = []
+    monkeypatch.setattr(
+        BackgroundTasks, "add_task", lambda self, func, *args: tasks.append((func, args))
+    )
+    async with _client_with(fake_session) as client:
+        body = (await client.post("/analyze/text", json={"text": SCAM_EXAMPLES[0][1]})).json()
+    assert fake_session.all(Analysis) == []  # not saved inline
+    [(func, args)] = tasks
+    assert func is analyze.save_analysis
+    await analyze.save_analysis(*args)  # type: ignore[arg-type]
+    [row] = fake_session.all(Analysis)
+    assert str(row.id) == body["id"]
+    assert row.created_at.isoformat().replace("+00:00", "Z") == body["created_at"]

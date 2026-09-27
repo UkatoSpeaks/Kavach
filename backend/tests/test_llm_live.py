@@ -17,7 +17,13 @@ def reasoner() -> GroqReasoner:
     s = get_settings()
     if not s.GROQ_API_KEY:
         pytest.skip("GROQ_API_KEY is not set")
-    return GroqReasoner(s.GROQ_API_KEY, s.GROQ_MODEL, s.GROQ_FALLBACK_MODEL, s.LLM_TIMEOUT_S)
+    return GroqReasoner(
+        s.GROQ_API_KEY,
+        s.GROQ_MODEL,
+        s.GROQ_FALLBACK_MODEL,
+        s.LLM_TIMEOUT_S,
+        reasoning_effort=s.GROQ_REASONING_EFFORT,
+    )
 
 
 @pytest.mark.parametrize("text", [SCAM_EXAMPLES[0][1], INJECTION], ids=["pin-scam", "injection"])

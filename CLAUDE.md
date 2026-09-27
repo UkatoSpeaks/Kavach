@@ -14,48 +14,72 @@ and returns an explainable scam verdict for Indian users. Differentiators:
 ## Hard constraints
 
 - **No Docker.** The developer's machine has limited disk space. Never add Dockerfiles, docker-compose, or instructions that require Docker.
-- **Keep local installs light.** Do NOT add `torch`, `tensorflow`, or `sentence-transformers` to the backend. Embeddings come from an API; the classifier is served with `onnxruntime`. Training happens separately on Google Colab.
-- **Free tier only.** Database = Supabase (hosted Postgres + pgvector). LLM = Gemini API free tier (primary) or Groq (fallback). No paid services.
+- **Keep local installs light.** Do NOT add `torch`, `tensorflow`, or `sentence-transformers` to the backend. Embeddings are computed locally with `fastembed` (ONNX, no torch); the classifier will be served with `onnxruntime`. Training happens separately on Google Colab.
+- **Free tier only.** Database = Supabase (hosted Postgres + pgvector). LLM = Groq free tier. No paid services.
 - **No Redis for now.** Cache in Postgres (`url_cache` table) or an in-process TTL cache.
 
 ## Stack
 
 - Python 3.11+, FastAPI, Uvicorn, Pydantic v2, pydantic-settings
 - SQLAlchemy 2.0 (async) + asyncpg, Alembic migrations, pgvector (`pgvector` Python package)
-- LangGraph for the analysis agent; LLM via `google-genai` (Gemini) with a Groq fallback
-- httpx for outbound calls; pytest + pytest-asyncio for tests; ruff for lint/format
-- Dependency management: `uv` if available, otherwise `venv` + `requirements.txt`
+- LangGraph for the analysis agent
+- LLM: Groq (`groq` SDK), JSON mode. Models come from config: `GROQ_MODEL` (currently
+  `openai/gpt-oss-120b`), falling back to `GROQ_FALLBACK_MODEL` (currently `openai/gpt-oss-20b`)
+  on rate limits/errors, then to template explanations. No `GROQ_API_KEY` → templates only.
+  `GROQ_REASONING_EFFORT=low` (gpt-oss reasoning tokens count toward `max_tokens` and the free
+  tier's 8k tokens/minute). Keep the system prompt lean for the same reason.
+- Embeddings: local `fastembed`, `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`,
+  384-dim (`EMBEDDING_MODEL` / `EMBEDDING_DIM`). Downloaded once (~240 MB) into
+  `backend/.cache/fastembed` (gitignored); loads in a background thread at startup.
+- QR decode: `zxing-cpp` + Pillow.
+- Screenshots (OCR): **undecided.** A Groq vision model if one is available on the free tier,
+  otherwise a small local OCR (no torch). Not built yet.
+- httpx for outbound calls; pytest + pytest-asyncio + respx for tests; ruff for lint/format
+- Dependency management: `uv` (`pyproject.toml` + `uv.lock`)
 
 ## Layout
 
 ```
 backend/
   app/
-    main.py                 # FastAPI app, lifespan, router registration
-    api/routes/             # health.py, analyze.py, report.py
-    core/                   # config.py (settings), logging.py, errors.py
+    main.py                 # FastAPI app, lifespan (engine, http client, embedder, graph, reasoner)
+    api/
+      deps.py               # session, session factory, http client, pattern search, reasoner
+      routes/               # health.py, analyze.py (/analyze/{text,url,upi,qr}, GET /analysis/{id}), report.py
+    core/                   # config.py (settings, signal weights), enums.py, logging.py (JSON logs, request id)
     db/                     # base.py, session.py, models.py
-    schemas/                # pydantic request/response models
+    schemas/                # analysis.py (AnalysisResult), entities.py
     services/
-      extractors.py         # URLs, UPI IDs, phones, amounts, OTP mentions
+      extractors.py         # URLs, UPI IDs, upi:// URIs, phones, amounts, sensitive-info mentions
       rules.py              # weighted rule engine
       upi.py                # UPI ID + upi:// URI analysis
       qr.py                 # QR decode
-      ocr.py                # screenshot -> text
-      url_intel.py          # Safe Browsing, phishing feeds, domain age
-      reputation.py         # community-reported entities
-      embeddings.py         # embedding API wrapper
-      rag.py                # pgvector retrieval
-      classifier.py         # ONNX model inference
+      url_intel.py          # link expansion (SSRF-safe), RDAP domain age, Safe Browsing
+      cache.py              # url_cache table + in-request memory cache
+      reputation.py         # community-reported entities (one query for all entities)
+      knowledge_base.py     # parses data/scam_patterns/*.md (frontmatter + sections)
+      embeddings.py         # local fastembed wrapper (background load, fails soft)
+      rag.py                # pgvector retrieval -> pattern_similarity signal
       scoring.py            # combines signals -> final score + breakdown
-      agent/                # LangGraph graph, nodes, prompts
+      explain.py            # template explanations/advice (used when the LLM is off or fails)
+      pipeline.py           # the steps: extract_step, run_checks (concurrent), finish
+      agent/
+        graph.py            # LangGraph: extract -> run_checks -> reason (LLM) -> finalize
+        nodes.py            # graph nodes (thin wrappers over pipeline.py)
+        state.py            # AnalysisState, AnalysisContext
+        llm.py              # GroqReasoner: retries, fallback model, output validation, LRU+TTL cache
+        prompts.py          # system prompt (injection defences, Hindi style, identifier rule)
+      # planned: classifier.py (ONNX inference), ocr.py (screenshot -> text)
   alembic/
   data/
-    scam_patterns/          # markdown knowledge-base docs
+    scam_patterns/          # markdown knowledge-base docs (scam + genuine patterns)
     datasets/               # raw + processed training data (gitignored if large)
-  ml/                       # Colab notebooks, eval scripts
-  scripts/                  # seed/ingest scripts
+  ml/                       # eval_retrieval.py; Colab notebooks later
+  scripts/                  # ingest_patterns.py (embed KB into pgvector), seed_reported.py
   tests/
+    conftest.py             # make_client (no DB), make_db_client (rolled-back DB), fake DNS
+    fakes.py                # FakeSession, InMemoryReputation, FakeEmbedder, FakeReasoner, ...
+    examples.py             # 36 labelled messages shared by scoring/API/agent tests
 ```
 
 ## Conventions
@@ -65,13 +89,25 @@ backend/
   `risk_score (0-100)`, `verdict (safe|suspicious|scam)`, `scam_type`, `red_flags[]`,
   `signal_breakdown[]` (source, score, weight, detail), `explanation_en`, `explanation_hi`, `advice[]`, `similar_patterns[]`.
 - The LLM explains; it does not decide alone. Final score = weighted combination of rules, classifier, reputation/URL intel, and LLM judgement. Weights live in config.
-- All external calls have timeouts and fail soft: if Gemini/Safe Browsing is down, return a result from the remaining signals and note the missing signal.
+- LLM output is validated before use: schema, no invented contact details, and identifiers
+  (UPI IDs, URLs, phone numbers) in `explanation_hi` exactly as in the message, never
+  transliterated. Invalid → retry once → template explanations.
+- All external calls have timeouts and fail soft: if Groq/Safe Browsing/the database is down, return a result from the remaining signals and note the missing signal.
+- Network checks (url_intel, reputation, pattern retrieval) run concurrently in `pipeline.run_checks`.
+  Analyses are saved to Supabase in a background task after the response is sent; the id is
+  generated up front. A failed save is logged and `GET /analysis/{id}` then returns 404.
 - Secrets only in `.env` (never committed). Provide `.env.example`.
-- Commands:
+- Commands (from `backend/`, prefix with `uv run`):
   - run: `uvicorn app.main:app --reload`
-  - test: `pytest -q`
+  - migrate: `alembic upgrade head`; load the knowledge base: `python -m scripts.ingest_patterns`
   - lint: `ruff check . && ruff format --check .`
-  - migrate: `alembic upgrade head`
+- Tests. Markers `db` and `llm` are deselected by default (`addopts` in `pyproject.toml`):
+  - `pytest -q`: fast suite, no database, no network, no Groq (a few seconds). API tests use
+    `tests/fakes.py` (in-memory session, reputation, retriever, `FakeReasoner`).
+  - `pytest -q -m db`: tests against the real Supabase DB (writes rolled back; slow, ~2 min).
+  - `pytest -q -m llm`: tests that call the real Groq API (uses quota).
+  - `pytest -q -m ""`: everything.
+  - A new test that touches the DB must be marked `@pytest.mark.db`; one that calls Groq, `@pytest.mark.llm`.
 
 ## Scope (v1): UPI and link fraud only
 

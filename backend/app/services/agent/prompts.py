@@ -46,6 +46,28 @@ files). Use "other" for another kind of scam and "none" if it does not look like
 receipts share words with scams. Judge the request being made, not the vocabulary.
 7. Do not state a numeric score or a final verdict label; Kavach combines your estimate \
 with its other checks.
+8. Identifiers stay exactly as written in the message, in Latin script, in every field \
+including explanation_hi: UPI IDs, URLs, phone numbers, amounts, app names and brand names. \
+Never translate, transliterate, respell or reformat them. Write "bigbasket@okhdfc", never \
+"बिगबास्केट@okhdfc"; "PhonePe", never "फोनपे"; "9876543210", never "९८७६५४३२१०". If you \
+are unsure, leave the identifier out.
+
+HINDI STYLE (explanation_hi, and advice when it is in Hindi):
+- Write everyday Hindi the way people in India speak it, not formal or Sanskritized Hindi.
+- Keep common English loanwords, written in Devanagari the way they are used in India: \
+कैशबैक, लिंक, रिफंड, ऐप, मैसेज, अकाउंट, पेमेंट, रिक्वेस्ट, ऑफ़र, टास्क, नंबर.
+- Keep acronyms in Latin script: UPI, UPI PIN, PIN, OTP, KYC, SMS.
+- Avoid literal or bookish translations: not "नकद-बैक" (write कैशबैक), not "कड़ी" or \
+"संपर्क सूत्र" (write लिंक), not "प्रतिदाय" (write रिफंड), not "अनुप्रयोग" (write ऐप).
+- Short, direct sentences.
+
+Two examples of good explanation_hi (the identifiers are made up):
+- "यह धोखा है। ₹4,999 का कैशबैक देने के नाम पर आपसे UPI PIN डालने को कहा जा रहा है। \
+पैसे लेने के लिए कभी UPI PIN नहीं डालना पड़ता, PIN सिर्फ़ पैसे भेजने के लिए होता है। \
+reward.cashback@ybl की रिक्वेस्ट रिजेक्ट कर दें।"
+- "यह मैसेज धोखा लगता है। KYC अपडेट के नाम पर https://sbi-kyc-verify.top/login लिंक \
+भेजा गया है, जो SBI की असली वेबसाइट नहीं है। इस लिंक पर कोई जानकारी न डालें और OTP \
+किसी को न बताएं।"
 
 OUTPUT: exactly one JSON object with these keys and nothing else:
 {
@@ -55,8 +77,7 @@ OUTPUT: exactly one JSON object with these keys and nothing else:
   "explanation_en": at most 60 words of plain English: does it look like a scam, and the \
 strongest reasons from the evidence,
   "explanation_hi": at most 60 words of simple everyday Hindi in Devanagari script, the way \
-you would explain it to your parents. Words like OTP, UPI, PIN, link and app may stay in \
-English,
+you would explain it to your parents (see HINDI STYLE; identifiers unchanged, see rule 8),
   "advice": 3 to 5 short, concrete steps (at most 15 words each) in the language given by \
 EVIDENCE.advice_language,
   "cited_flags": the codes from EVIDENCE.red_flags that support your explanation, [] if \
@@ -80,6 +101,16 @@ def user_prompt(evidence: dict[str, Any], message: str, nonce: str | None = None
         f"{begin}\n{body}\n{end}\n\n"
         "Reply with the JSON object only."
     )
+
+
+# Appended as an extra user turn when the first reply altered an identifier in
+# explanation_hi (llm.AlteredIdentifiers). Fixed text: nothing from the message is echoed.
+IDENTIFIER_RETRY_NOTE = (
+    "Your previous reply changed an identifier in explanation_hi: a UPI ID, URL or phone "
+    "number was translated, transliterated or respelled. Follow rule 8: copy identifiers "
+    "exactly as they appear in the MESSAGE, in Latin script, or leave them out. Reply with "
+    "the corrected JSON object only."
+)
 
 
 def messages(evidence: dict[str, Any], message: str) -> list[dict[str, str]]:

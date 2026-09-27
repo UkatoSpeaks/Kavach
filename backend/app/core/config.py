@@ -45,6 +45,10 @@ class Settings(BaseSettings):
     GROQ_MODEL: str = "openai/gpt-oss-120b"
     # Used when GROQ_MODEL is rate limited (429) or errors; after that, template explanations.
     GROQ_FALLBACK_MODEL: str = "openai/gpt-oss-20b"
+    # Reasoning effort for reasoning models (gpt-oss). Their reasoning tokens count toward
+    # the reply's token limit and the free tier's tokens-per-minute; "medium" often runs out
+    # before the JSON is written. Empty/None: not sent (for non-reasoning models).
+    GROQ_REASONING_EFFORT: Literal["low", "medium", "high"] | None = "low"
     LLM_TIMEOUT_S: float = 8.0
     # In-process cache of LLM results, to protect the free-tier quota.
     LLM_CACHE_SIZE: int = 500
@@ -111,6 +115,11 @@ class Settings(BaseSettings):
         if not 0 <= self.PATTERN_MIN_MARGIN < self.PATTERN_FULL_MARGIN <= 1:
             raise ValueError("need 0 <= PATTERN_MIN_MARGIN < PATTERN_FULL_MARGIN <= 1")
         return self
+
+    @field_validator("GROQ_REASONING_EFFORT", mode="before")
+    @classmethod
+    def _empty_is_none(cls, v: object) -> object:
+        return None if isinstance(v, str) and not v.strip() else v
 
     @field_validator("EMBEDDING_CACHE_DIR")
     @classmethod

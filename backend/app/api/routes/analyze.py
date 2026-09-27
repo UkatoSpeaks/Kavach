@@ -1,13 +1,13 @@
 import asyncio
 import logging
-from datetime import timedelta
+import time
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import (
@@ -37,6 +37,7 @@ MAX_URL_CHARS = 2048
 DB_SAVE_TIMEOUT_S = 5
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
+SessionFactoryDep = Annotated[SessionFactory | None, Depends(get_session_factory)]
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 
 
@@ -109,46 +110,80 @@ class AnalyzeUPIRequest(BaseModel):
         return self
 
 
-async def _save(
-    session: AsyncSession,
-    out: PipelineOutput,
-    input_type: InputType,
-    raw_input: str,
-    language_hint: str | None = None,
-) -> AnalysisResult:
-    result = out.result
-    row = Analysis(
-        input_type=input_type,
-        raw_input=raw_input,
-        normalized_text=out.entities.normalized_text,
-        extracted_entities=out.entities.model_dump(mode="json"),
-        language_hint=language_hint,
-        latency_ms=out.latency_ms,
-        **result.model_dump(
-            mode="json",
-            include={
-                "risk_score", "verdict", "scam_type", "red_flags", "signal_breakdown",
-                "explanation_en", "explanation_hi", "advice", "similar_patterns",
-                "confidence",
-            },
-        ),
-    )  # fmt: skip
-    # Fail soft: if the database is down the user still gets the verdict, just no id.
+class Saver:
+    """Saves analyses after the response is sent (FastAPI BackgroundTasks).
+
+    The id and created_at are generated up front, so the response carries them even though
+    the row isn't written yet. If the save fails it is logged and GET /analysis/{id}
+    returns 404. The save runs on a session of its own: the request's session is closed
+    by the time background tasks run.
+    """
+
+    def __init__(self, background: BackgroundTasks, sessions: SessionFactoryDep) -> None:
+        self.background = background
+        self.sessions = sessions
+
+    def __call__(
+        self,
+        out: PipelineOutput,
+        input_type: InputType,
+        raw_input: str,
+        language_hint: str | None = None,
+    ) -> AnalysisResult:
+        result = out.result.model_copy(update={"id": uuid4(), "created_at": datetime.now(UTC)})
+        row = Analysis(
+            id=result.id,
+            created_at=result.created_at,
+            input_type=input_type,
+            raw_input=raw_input,
+            normalized_text=out.entities.normalized_text,
+            extracted_entities=out.entities.model_dump(mode="json"),
+            language_hint=language_hint,
+            latency_ms=out.latency_ms,
+            **result.model_dump(
+                mode="json",
+                include={
+                    "risk_score", "verdict", "scam_type", "red_flags", "signal_breakdown",
+                    "explanation_en", "explanation_hi", "advice", "similar_patterns",
+                    "confidence",
+                },
+            ),
+        )  # fmt: skip
+        self.background.add_task(save_analysis, self.sessions, row)
+        return result
+
+
+async def save_analysis(sessions: SessionFactory | None, row: Analysis) -> None:
+    """Background task. Never raises: nobody is left to handle it."""
+    if sessions is None:
+        logger.warning("analysis %s not saved: no database configured", row.id)
+        return
+    start = time.perf_counter()
     try:
-        async with asyncio.timeout(DB_SAVE_TIMEOUT_S):
+        async with asyncio.timeout(DB_SAVE_TIMEOUT_S), sessions() as session:
             session.add(row)
             await session.commit()
-    except (SQLAlchemyError, OSError, TimeoutError) as exc:
-        logger.warning("could not save analysis: %s: %s", type(exc).__name__, exc)
-        await session.rollback()
-        return result
-    return result.model_copy(update={"id": row.id, "created_at": row.created_at})
+    except Exception as exc:
+        logger.warning("could not save analysis %s: %s: %s", row.id, type(exc).__name__, exc)
+        return
+    logger.info(
+        "analysis saved",
+        extra={
+            "extra_fields": {
+                "analysis_id": str(row.id),
+                "save_ms": round((time.perf_counter() - start) * 1000, 1),
+            }
+        },
+    )
+
+
+SaverDep = Annotated[Saver, Depends()]
 
 
 @router.post("/analyze/text", response_model=AnalysisResult)
 async def analyze_text_route(
     body: AnalyzeTextRequest,
-    session: SessionDep,
+    save: SaverDep,
     settings: SettingsDep,
     checks: ChecksDep,
     reasoner: ReasonerDep,
@@ -162,13 +197,13 @@ async def analyze_text_route(
         language_hint=body.language_hint,
         explain=explain,
     )
-    return await _save(session, out, InputType.TEXT, body.text, body.language_hint)
+    return save(out, InputType.TEXT, body.text, body.language_hint)
 
 
 @router.post("/analyze/url", response_model=AnalysisResult)
 async def analyze_url_route(
     body: AnalyzeURLRequest,
-    session: SessionDep,
+    save: SaverDep,
     settings: SettingsDep,
     checks: ChecksDep,
     reasoner: ReasonerDep,
@@ -177,13 +212,13 @@ async def analyze_url_route(
     out = await run_analysis(
         body.url, settings, checks=checks, reasoner=reasoner, message_text=False, explain=explain
     )
-    return await _save(session, out, InputType.URL, body.url)
+    return save(out, InputType.URL, body.url)
 
 
 @router.post("/analyze/upi", response_model=AnalysisResult)
 async def analyze_upi_route(
     body: AnalyzeUPIRequest,
-    session: SessionDep,
+    save: SaverDep,
     settings: SettingsDep,
     checks: ChecksDep,
     reasoner: ReasonerDep,
@@ -193,7 +228,7 @@ async def analyze_upi_route(
     out = await run_analysis(
         value, settings, checks=checks, reasoner=reasoner, message_text=False, explain=explain
     )
-    return await _save(session, out, InputType.UPI, value)
+    return save(out, InputType.UPI, value)
 
 
 @router.post(
@@ -206,7 +241,7 @@ async def analyze_upi_route(
     },
 )
 async def analyze_qr_route(
-    session: SessionDep,
+    save: SaverDep,
     settings: SettingsDep,
     checks: ChecksDep,
     reasoner: ReasonerDep,
@@ -232,7 +267,7 @@ async def analyze_qr_route(
         message_text=decoded.kind == "text",
         explain=explain,
     )
-    return await _save(session, out, InputType.QR, decoded.payload)
+    return save(out, InputType.QR, decoded.payload)
 
 
 @router.get("/analysis/{analysis_id}", response_model=AnalysisResult)

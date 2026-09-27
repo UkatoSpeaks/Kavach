@@ -4,7 +4,9 @@ The LLM explains; it never decides alone. These tests pin down what it may and m
 to the score and verdict.
 """
 
-from collections.abc import AsyncIterator, Callable
+import asyncio
+import time
+from collections.abc import AsyncIterator, Callable, Sequence
 from datetime import timedelta
 
 import httpx
@@ -12,16 +14,18 @@ import pytest
 import respx
 
 from app.core.config import get_settings
-from app.core.enums import ScamType, Verdict
+from app.core.enums import EntityType, PatternKind, ScamType, Verdict
+from app.db.models import ReportedEntity
 from app.schemas.analysis import AnalysisResult
-from app.services import explain
+from app.services import explain, pipeline, rag
 from app.services.agent.graph import get_graph, run_analysis
 from app.services.agent.llm import Evidence, LLMAssessment
 from app.services.cache import LookupCache
 from app.services.pipeline import Checks, PipelineOutput
+from app.services.rag import PatternMatch
 from app.services.scoring import SignalOutcome, Thresholds, score
 from tests.examples import GENUINE_EXAMPLES, SCAM_EXAMPLES
-from tests.fakes import FakeReasoner, assessment, fake_pattern_search
+from tests.fakes import FakeEmbedder, FakeReasoner, assessment, fake_pattern_search
 from tests.test_scoring import rule_result
 
 SETTINGS = get_settings().model_copy(update={"SAFE_BROWSING_API_KEY": ""})
@@ -55,6 +59,65 @@ def signal(result: AnalysisResult, source: str):  # type: ignore[no-untyped-def]
 def test_graph_is_compiled_once() -> None:
     assert get_graph() is get_graph()
     assert set(get_graph().get_graph().nodes) >= {"extract", "run_checks", "reason", "finalize"}
+
+
+SLOW_S = 0.3
+
+
+async def test_network_checks_run_concurrently(monkeypatch: pytest.MonkeyPatch) -> None:
+    """url_intel, reputation and both pattern retrievals overlap in time, through the
+    graph. Each takes SLOW_S; run one after another they would take 4x that."""
+    events: list[tuple[str, str]] = []
+
+    async def slow(name: str) -> None:
+        events.append(("start", name))
+        await asyncio.sleep(SLOW_S)
+        events.append(("end", name))
+
+    async def url_intel(*_: object, **__: object) -> SignalOutcome:
+        await slow("url_intel")
+        return SignalOutcome("url_intel", 0, "checked")
+
+    reputation_calls: list[Sequence[tuple[EntityType, str]]] = []
+
+    async def find_reported(keys: Sequence[tuple[EntityType, str]]) -> list[ReportedEntity]:
+        reputation_calls.append(keys)
+        await slow("reputation")
+        return []
+
+    async def retrieve(_: Sequence[float], kind: PatternKind, k: int) -> list[PatternMatch]:
+        await slow(f"patterns.{kind.value}")
+        return []
+
+    monkeypatch.setattr(pipeline.url_intel, "url_intel", url_intel)
+    text = (
+        "Refund ke liye refund-help@ybl pe bhejo ya 9123456780 call karo: https://refund-help.xyz/c"
+    )
+    async with httpx.AsyncClient() as client:
+        checks = Checks(
+            client,
+            LookupCache(None, timedelta(hours=1)),
+            find_reported,
+            rag.PatternSearch(FakeEmbedder(), retrieve),
+        )
+        start = time.perf_counter()
+        out = await run(text, checks, None, explain=False)
+        elapsed = time.perf_counter() - start
+
+    starts = [n for kind, n in events if kind == "start"]
+    first_end = next(i for i, (kind, _) in enumerate(events) if kind == "end")
+    assert len(starts) == 4 and events[:4] == [("start", n) for n in starts]
+    assert first_end == 4  # all four started before any finished
+    assert elapsed < SLOW_S * 2
+    assert out.latency_ms["node.run_checks"] < SLOW_S * 2 * 1000
+    # One reputation lookup for every entity in the message, not one per entity.
+    assert len(reputation_calls) == 1
+    assert {t for t, _ in reputation_calls[0]} == {
+        EntityType.UPI,
+        EntityType.PHONE,
+        EntityType.URL,
+        EntityType.DOMAIN,
+    }
 
 
 async def test_llm_explanation_is_used_when_it_agrees(checks: Checks) -> None:

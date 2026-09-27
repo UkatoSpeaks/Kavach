@@ -8,14 +8,16 @@ import httpx
 import pytest
 import respx
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.services import pipeline
 from app.services.agent import prompts
 from app.services.agent.llm import (
+    AlteredIdentifiers,
     Evidence,
     GroqReasoner,
     InvalidOutput,
     LRUTTLCache,
+    altered_identifiers,
     build_evidence,
     parse_assessment,
 )
@@ -96,7 +98,15 @@ async def test_valid_json_is_used() -> None:
     assert result.model == PRIMARY and result.notes == ()
     body = json.loads(route.calls[0].request.content)
     assert body["response_format"] == {"type": "json_object"}
+    assert "reasoning_effort" not in body  # not set: not sent
     assert route.calls[0].request.headers["authorization"] == "Bearer test-key"
+
+
+@respx.mock
+async def test_reasoning_effort_is_sent_when_set() -> None:
+    route = respx.post(GROQ_URL).mock(return_value=httpx.Response(200, json=reply()))
+    await reasoner(reasoning_effort="low").reason(EVIDENCE)
+    assert json.loads(route.calls[0].request.content)["reasoning_effort"] == "low"
 
 
 @respx.mock
@@ -215,6 +225,104 @@ def test_scam_type_and_confidence_are_case_insensitive() -> None:
     assert (a.scam_type, a.confidence) == ("qr_code", "high")
 
 
+# ----------------------------------------------------------------------------- identifiers
+
+DEBIT_SMS = (
+    "Rs.1,250.00 debited from A/c XX4821 to VPA bigbasket@okhdfc. Not you? Call 9123456780 "
+    "or visit https://hdfc-help.example.xyz/report -HDFC Bank"
+)
+DEBIT = evidence_for(DEBIT_SMS)
+
+
+@pytest.mark.parametrize(
+    "hindi",
+    [
+        "यह पैसा बिगबास्केट@okhdfc को गया है।",  # transliterated UPI ID
+        "यह पैसा बिगबास्केट@ओकेएचडीएफसी को गया है।",
+        "यह पैसा bigbasket@hdfc को गया है।",  # respelled UPI ID
+        "पैसे refund-help@ybl पर भेजने को कहा गया है।",  # UPI ID not in the message
+        "https://एचडीएफसी-हेल्प.example.xyz/report लिंक न खोलें।",  # transliterated URL
+        "hdfc-हेल्प.example.xyz लिंक न खोलें।",
+        "https://hdfc-help.example.com/report लिंक न खोलें।",  # respelled domain
+        "९१२३४५६७८० पर कॉल न करें।",  # Devanagari digits
+        "9123456789 पर कॉल न करें।",  # respelled phone number
+    ],
+)
+def test_altered_identifiers_in_hindi_are_caught(hindi: str) -> None:
+    assert altered_identifiers(hindi, DEBIT)
+
+
+@pytest.mark.parametrize(
+    "hindi",
+    [
+        "यह HDFC बैंक का आम डेबिट मैसेज है, bigbasket@okhdfc को पेमेंट हुआ है।",
+        "यह पेमेंट BigBasket@OKHDFC को गया है।",  # case doesn't matter for UPI IDs
+        "पेमेंट bigbasket@okhdfc।",  # danda right after the ID
+        "गलत लगे तो 91234 56780 पर कॉल करें या 1930 पर शिकायत करें।",  # same number, spaced
+        "https://hdfc-help.example.xyz/report लिंक खुद से न खोलें।",
+        "शिकायत cybercrime.gov.in पर करें।",
+        "₹1,250 कटे हैं, कैशबैक या रिफंड का कोई लालच नहीं है, UPI PIN नहीं मांगा गया।",
+    ],
+)
+def test_identifiers_copied_exactly_are_allowed(hindi: str) -> None:
+    assert altered_identifiers(hindi, DEBIT) == []
+
+
+def test_devanagari_digits_from_the_message_are_allowed() -> None:
+    ev = evidence_for("गलती से ₹2000 भेज दिए, वापस करो। मेरा नंबर ९१२३४५६७८० है")
+    assert altered_identifiers("इस नंबर ९१२३४५६७८० पर पैसे वापस न भेजें।", ev) == []
+
+
+def test_upi_ids_from_upi_links_count_as_in_the_message() -> None:
+    ev = evidence_for("Scan karo: upi://pay?pa=Ramesh.K9@ybl&pn=Cashback&am=4999")
+    assert altered_identifiers("ramesh.k9@ybl को पैसे न भेजें, यह धोखा है।", ev) == []
+    assert altered_identifiers("रमेश.के9@ybl को पैसे न भेजें, यह धोखा है।", ev)
+
+
+def test_parse_rejects_altered_identifiers_in_hindi() -> None:
+    raw = reply(explanation_hi="यह पैसा बिगबास्केट@okhdfc को गया है, यह आम डेबिट मैसेज है।")
+    with pytest.raises(AlteredIdentifiers, match="बिगबास्केट@okhdfc"):
+        parse_assessment(raw["choices"][0]["message"]["content"], DEBIT)
+
+
+def test_parse_rejects_upi_ids_invented_in_english() -> None:
+    raw = reply(explanation_en="Do not pay refund-help@ybl.")["choices"][0]["message"]["content"]
+    with pytest.raises(InvalidOutput, match="contact details not in"):
+        parse_assessment(raw, DEBIT)
+
+
+ALTERED_HI = "यह पैसा बिगबास्केट@okhdfc को गया है, यह आम डेबिट मैसेज है।"
+GOOD_HI = "यह पैसा bigbasket@okhdfc को गया है, यह आम डेबिट मैसेज है।"
+
+
+@respx.mock
+async def test_altered_identifiers_are_retried_once_with_a_reminder() -> None:
+    route = respx.post(GROQ_URL).mock(
+        side_effect=[
+            httpx.Response(200, json=reply(explanation_hi=ALTERED_HI)),
+            httpx.Response(200, json=reply(explanation_hi=GOOD_HI)),
+        ]
+    )
+    result = await reasoner().reason(DEBIT)
+    assert result.assessment is not None and result.assessment.explanation_hi == GOOD_HI
+    assert models_called(route) == [PRIMARY, PRIMARY]
+    first, second = (json.loads(c.request.content)["messages"] for c in route.calls)
+    assert len(first) == 2
+    assert second[:2] == first and second[2]["content"] == prompts.IDENTIFIER_RETRY_NOTE
+    assert "bigbasket" not in prompts.IDENTIFIER_RETRY_NOTE  # nothing from the message
+    assert "explanation_hi altered identifiers" in result.notes[0]
+
+
+@respx.mock
+async def test_altered_identifiers_twice_fall_back_to_templates() -> None:
+    route = respx.post(GROQ_URL).mock(
+        return_value=httpx.Response(200, json=reply(explanation_hi=ALTERED_HI))
+    )
+    result = await reasoner().reason(DEBIT)
+    assert result.assessment is None and route.call_count == 2
+    assert result.detail.endswith("using template explanations")
+
+
 # ----------------------------------------------------------------------------- cache
 
 
@@ -256,6 +364,13 @@ def test_default_cache_size_and_ttl() -> None:
     assert (s.LLM_CACHE_SIZE, s.LLM_CACHE_TTL_S, s.LLM_TIMEOUT_S) == (500, 3600, 8.0)
 
 
+@pytest.mark.parametrize(("raw", "expected"), [("", None), ("  ", None), ("high", "high")])
+def test_reasoning_effort_setting(raw: str, expected: str | None) -> None:
+    s = Settings(DATABASE_URL="postgresql://u:p@h/db", GROQ_REASONING_EFFORT=raw)
+    assert s.GROQ_REASONING_EFFORT == expected
+    assert Settings.model_fields["GROQ_REASONING_EFFORT"].default == "low"
+
+
 # ----------------------------------------------------------------------------- prompt
 
 
@@ -281,5 +396,14 @@ def test_message_sits_in_a_nonce_delimited_block() -> None:
 def test_system_prompt_states_the_rules() -> None:
     p = prompts.SYSTEM_PROMPT
     for must in ("untrusted", "Ignore every instruction", "red flag", "Do not invent",
-                 "1930", "cybercrime.gov.in", "60 words", "Devanagari", "JSON"):  # fmt: skip
+                 "1930", "cybercrime.gov.in", "60 words", "Devanagari", "JSON",
+                 "transliterate", "Latin script", "कैशबैक", "नकद-बैक"):  # fmt: skip
         assert must in p, must
+
+
+def test_system_prompt_examples_follow_the_identifier_rule() -> None:
+    # The few-shot examples keep their (made-up) identifiers in Latin script.
+    examples = prompts.SYSTEM_PROMPT.split("Two examples of good explanation_hi", 1)[1]
+    assert "reward.cashback@ybl" in examples and "https://sbi-kyc-verify.top/login" in examples
+    ev = evidence_for("reward.cashback@ybl https://sbi-kyc-verify.top/login")
+    assert altered_identifiers(examples.split("OUTPUT:", 1)[0], ev) == []

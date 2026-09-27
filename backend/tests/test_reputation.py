@@ -2,7 +2,7 @@ import uuid
 
 import pytest
 import respx
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.enums import EntityType
@@ -12,6 +12,7 @@ from app.services.reputation import (
     MANY_REPORTS_FLOOR,
     VERIFIED_FLOOR,
     entity_keys,
+    find_reported,
     normalize,
     reputation_signal,
 )
@@ -84,6 +85,30 @@ def test_no_reports_is_not_informative() -> None:
 
 
 # ----------------------------------------------------------------------------- DB + API
+
+
+@pytest.mark.db
+async def test_find_reported_is_one_query_for_all_entities(db_session: AsyncSession) -> None:
+    await seed(db_session)
+    entities = extract_entities(
+        "Pay demo-kyc-help@ybl, call +91 99999 00001 or open https://demo-kyc-update.xyz/x"
+    )
+    keys = entity_keys(entities)
+    assert {t for t, _ in keys} == {U, P, L, D}
+    statements: list[str] = []
+    sync_engine = db_session.bind.sync_engine  # type: ignore[union-attr]
+
+    def count(*args: object) -> None:
+        if not str(args[2]).startswith("SAVEPOINT"):  # the test's rolled-back transaction
+            statements.append(str(args[2]))
+
+    event.listen(sync_engine, "before_cursor_execute", count)
+    try:
+        found = await find_reported(db_session, keys)
+    finally:
+        event.remove(sync_engine, "before_cursor_execute", count)
+    assert len(statements) == 1 and statements[0].lstrip().upper().startswith("SELECT")
+    assert {e.value for e in found} >= {"demo-kyc-help@ybl", "+919999900001"}
 
 
 @pytest.mark.db
