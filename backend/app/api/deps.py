@@ -1,9 +1,40 @@
 from collections.abc import AsyncIterator
+from typing import Annotated
 
-from fastapi import Request
+import httpx
+from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import Settings, get_settings
+from app.db.session import SessionFactory
 
 
 async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
     async with request.app.state.sessionmaker() as session:
         yield session
+
+
+def get_session_factory(request: Request) -> SessionFactory | None:
+    """Short-lived sessions for concurrent checks (cache, reputation). None if the app
+    started without a database."""
+    return getattr(request.app.state, "sessionmaker", None)
+
+
+def new_http_client(timeout_s: float) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        timeout=timeout_s,
+        follow_redirects=False,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; KavachLinkCheck/0.1)"},
+    )
+
+
+async def get_http_client(
+    request: Request, settings: Annotated[Settings, Depends(get_settings)]
+) -> AsyncIterator[httpx.AsyncClient]:
+    """The app-wide client from the lifespan, or a per-request one if there is none."""
+    client = getattr(request.app.state, "http_client", None)
+    if client is not None:
+        yield client
+        return
+    async with new_http_client(settings.HTTP_TIMEOUT_S) as client:
+        yield client

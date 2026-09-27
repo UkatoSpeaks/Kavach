@@ -1,3 +1,5 @@
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
 from uuid import uuid4
 
 from sqlalchemy.ext.asyncio import (
@@ -6,6 +8,11 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+
+# Opens a short-lived session: `async with factory() as session: ...`. An
+# async_sessionmaker fits. Concurrent checks each open their own, since one AsyncSession
+# can't run queries in parallel.
+SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 
 
 def create_engine(database_url: str) -> AsyncEngine:

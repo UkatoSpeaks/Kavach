@@ -1,6 +1,7 @@
 """Template explanations and advice (no LLM). Built from the triggered rules."""
 
-from app.core.enums import ScamType, Verdict
+from app.core.enums import ScamType, Severity, Verdict
+from app.schemas.analysis import RedFlag
 from app.services.rules import RuleHit
 
 SCAM_TYPE_LABELS: dict[ScamType, tuple[str, str]] = {
@@ -75,14 +76,16 @@ SAFE_ADVICE = [
 ]  # fmt: skip
 MAX_ADVICE = 4
 MAX_REASONS = 4
+_SEVERITY_RANK = {Severity.HIGH: 0, Severity.MEDIUM: 1, Severity.LOW: 2}
 
 
 def explain(
-    verdict: Verdict, score: int, scam_type: ScamType | None, hits: list[RuleHit]
+    verdict: Verdict, score: int, scam_type: ScamType | None, flags: list[RedFlag]
 ) -> tuple[str, str]:
-    """(explanation_en, explanation_hi)."""
-    reasons_en = "; ".join(h.rule.description_en for h in hits[:MAX_REASONS])
-    reasons_hi = "; ".join(h.rule.description_hi for h in hits[:MAX_REASONS])
+    """(explanation_en, explanation_hi). Reasons are the red flags, most severe first."""
+    ranked = sorted(flags, key=lambda f: _SEVERITY_RANK[f.severity])[:MAX_REASONS]
+    reasons_en = "; ".join(f.message for f in ranked)
+    reasons_hi = "; ".join(f.message_hi or f.message for f in ranked)
     label_en, label_hi = SCAM_TYPE_LABELS[scam_type or ScamType.GENERIC]
 
     if verdict is Verdict.SCAM:
@@ -100,7 +103,7 @@ def explain(
     else:
         en = f"Low risk ({score}/100): no common scam patterns were found."
         hi = f"कम जोखिम ({score}/100): कोई आम धोखाधड़ी का तरीका नहीं मिला।"
-        if hits:
+        if flags:
             en += f" Minor signs: {reasons_en}."
             hi += f" छोटे संकेत: {reasons_hi}।"
     return en, hi

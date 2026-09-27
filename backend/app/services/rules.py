@@ -352,7 +352,8 @@ def _brand_in_host(host: str, suffix_labels: int) -> str | None:
     return None
 
 
-def _lookalike(url: ExtractedURL) -> str | None:
+def lookalike_brand(url: ExtractedURL) -> str | None:
+    """The brand a URL imitates, or None. Official and restricted domains never match."""
     if url.is_ip or url.registered_domain.endswith(RESTRICTED_SUFFIXES):
         return None
     if ("." + url.host).endswith(RESTRICTED_SUFFIXES):
@@ -447,7 +448,7 @@ def _short_url(text: str, e: ExtractedEntities) -> str | None:
 
 def _lookalike_domain(text: str, e: ExtractedEntities) -> str | None:
     for url in e.urls:
-        brand = _lookalike(url)
+        brand = lookalike_brand(url)
         if brand:
             return f"{url.host} (imitates '{brand}')"
     return None

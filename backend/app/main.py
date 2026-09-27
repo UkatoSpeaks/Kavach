@@ -4,7 +4,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api.routes import analyze, health
+from app.api.deps import new_http_client
+from app.api.routes import analyze, health, report
 from app.core.config import get_settings
 from app.core.logging import RequestIDMiddleware, setup_logging
 from app.db.session import create_engine, create_sessionmaker
@@ -20,10 +21,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.settings = settings
     app.state.engine = engine
     app.state.sessionmaker = create_sessionmaker(engine)
+    app.state.http_client = new_http_client(settings.HTTP_TIMEOUT_S)
     logger.info("startup complete", extra={"extra_fields": {"env": settings.ENV}})
     try:
         yield
     finally:
+        await app.state.http_client.aclose()
         await engine.dispose()
         logger.info("shutdown complete")
 
@@ -33,6 +36,7 @@ def create_app() -> FastAPI:
     app.add_middleware(RequestIDMiddleware)
     app.include_router(health.router)
     app.include_router(analyze.router)
+    app.include_router(report.router)
     return app
 
 

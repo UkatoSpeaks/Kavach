@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     # Must match the embedding model's output size. Changing it needs a migration.
     EMBEDDING_DIM: int = 384
 
+    # Real-world checks. Safe Browsing is skipped when no key is set.
+    SAFE_BROWSING_API_KEY: str = ""
+    HTTP_TIMEOUT_S: float = 5.0
+    URL_CACHE_TTL_HOURS: int = 24
+
     # Scoring. Relative weight of each signal in the final score; signals that are missing
     # for a request are skipped and the remaining weights renormalize to 1. Override in
     # .env as JSON, e.g. SIGNAL_WEIGHTS='{"rules": 0.5, "classifier": 0.5}'.
@@ -55,6 +60,7 @@ class Settings(BaseSettings):
         "rules": 0.30,
         "classifier": 0.25,
         "url_intel": 0.15,
+        "upi_check": 0.15,
         "reputation": 0.10,
         "pattern_similarity": 0.05,
         "llm": 0.15,
