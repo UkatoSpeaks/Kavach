@@ -1,0 +1,94 @@
+@import "tailwindcss";
+
+/*
+ * Design tokens: the single source of truth for colours, fonts, radii and shadows.
+ * Tailwind generates utilities from these (bg-paper, text-ink, shadow-brutal, font-display, ...).
+ */
+@theme {
+  /* Surfaces and ink */
+  --color-paper: #fbf8f1;
+  --color-card: #ffffff;
+  --color-ink: #111111;
+  --color-ink-muted: #3f3f46; /* secondary text, still > 10:1 on paper */
+
+  /* Brand accent */
+  --color-accent: #4338ca;
+  --color-accent-dark: #3730a3;
+  --color-accent-tint: #e0e7ff;
+
+  /* Verdict colours: use ONLY for verdicts. `-deep` is for text on the tint. */
+  --color-safe: #16a34a;
+  --color-safe-tint: #dcfce7;
+  --color-safe-deep: #166534;
+  --color-suspicious: #d97706;
+  --color-suspicious-tint: #fef3c7;
+  --color-suspicious-deep: #92400e;
+  --color-scam: #dc2626;
+  --color-scam-tint: #fee2e2;
+  --color-scam-deep: #991b1b;
+
+  /* Fonts (CSS variables are set by next/font in app/layout.tsx) */
+  --font-sans: var(--font-inter), var(--font-devanagari), ui-sans-serif, system-ui, sans-serif;
+  --font-display:
+    var(--font-bricolage), var(--font-devanagari), ui-sans-serif, system-ui, sans-serif;
+  --font-hindi: var(--font-devanagari), var(--font-inter), ui-sans-serif, sans-serif;
+
+  /* Type scale: 17px body with generous line-height for easy reading */
+  --text-sm: 0.9375rem;
+  --text-sm--line-height: 1.55;
+  --text-base: 1.0625rem;
+  --text-base--line-height: 1.7;
+  --text-lg: 1.1875rem;
+  --text-lg--line-height: 1.65;
+
+  /* Neo-brutalist shadows */
+  --shadow-brutal-sm: 2px 2px 0 var(--color-ink);
+  --shadow-brutal: 4px 4px 0 var(--color-ink);
+  --shadow-brutal-lg: 6px 6px 0 var(--color-ink);
+}
+
+html {
+  scroll-behavior: smooth;
+  /* Anchored sections land below the floating navbar */
+  scroll-padding-top: 6rem;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: var(--text-base--line-height);
+  overflow-x: clip;
+}
+
+/* Devanagari needs a little more vertical room than Latin text */
+:lang(hi) {
+  font-family: var(--font-hindi);
+  line-height: 1.8;
+}
+
+:focus-visible {
+  outline: 3px solid var(--color-accent);
+  outline-offset: 3px;
+  border-radius: 6px;
+}
+
+::selection {
+  background: var(--color-accent-tint);
+  color: var(--color-ink);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
