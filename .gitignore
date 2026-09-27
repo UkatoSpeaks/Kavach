@@ -1,0 +1,21 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# ML artifacts / large data
+*.onnx
+backend/data/datasets/raw/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
