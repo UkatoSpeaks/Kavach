@@ -45,6 +45,8 @@ class Settings(BaseSettings):
     GROQ_MODEL: str = "llama-3.3-70b-versatile"
     ENV: Literal["dev", "test", "prod"] = "dev"
     LOG_LEVEL: str = "INFO"
+    # Must match the embedding model's output size. Changing it needs a migration.
+    EMBEDDING_DIM: int = 384
 
     @field_validator("DATABASE_URL")
     @classmethod
