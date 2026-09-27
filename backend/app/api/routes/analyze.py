@@ -24,6 +24,7 @@ from app.core.enums import InputType
 from app.db.models import Analysis
 from app.db.session import SessionFactory
 from app.schemas.analysis import AnalysisResult
+from app.schemas.entities import ExtractedEntities
 from app.services import qr, rag, reputation
 from app.services.agent.graph import run_analysis
 from app.services.agent.llm import Reasoner
@@ -281,4 +282,6 @@ async def get_analysis(analysis_id: UUID, session: SessionDep) -> AnalysisResult
     row = await session.get(Analysis, analysis_id)
     if row is None:
         raise ApiError(404, "analysis not found")
-    return AnalysisResult.model_validate(row)
+    result = AnalysisResult.model_validate(row)
+    entities = ExtractedEntities.model_validate(row.extracted_entities)
+    return result.model_copy(update={"entities": reputation.reportable(entities)})

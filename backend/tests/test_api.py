@@ -86,6 +86,18 @@ async def test_saved_analysis_round_trips_through_db(db_session: AsyncSession) -
     assert got.json() == body
 
 
+async def test_analysis_lists_reportable_entities(client: httpx.AsyncClient) -> None:
+    text = "Refund pending. Pay demo-refund@ybl or call 9999900001: https://demo-kyc.xyz/pay"
+    body = (await client.post("/analyze/text", json={"text": text})).json()
+    assert body["entities"] == [
+        {"entity_type": "upi", "value": "demo-refund@ybl"},
+        {"entity_type": "phone", "value": "+919999900001"},
+        {"entity_type": "domain", "value": "demo-kyc.xyz"},
+    ]
+    # Rebuilt from the saved extracted_entities.
+    assert (await client.get(f"/analysis/{body['id']}")).json()["entities"] == body["entities"]
+
+
 async def test_analyze_genuine_is_safe(client: httpx.AsyncClient) -> None:
     resp = await client.post("/analyze/text", json={"text": GENUINE_EXAMPLES[0][1]})
     assert resp.status_code == 200

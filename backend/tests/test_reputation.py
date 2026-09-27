@@ -14,6 +14,7 @@ from app.services.reputation import (
     entity_keys,
     find_reported,
     normalize,
+    reportable,
     reputation_signal,
 )
 from scripts.seed_reported import DEMO_ENTITIES, seed
@@ -58,6 +59,21 @@ def test_entity_keys_cover_upi_phone_url_and_domains() -> None:
         (D, "login.demo-sbi-kyc.xyz"),
         (D, "demo-sbi-kyc.xyz"),
     }
+
+
+def test_reportable_offers_domains_but_full_urls_for_shorteners() -> None:
+    e = extract_entities(
+        "Pay demo-kyc-help@ybl or call 9999900001, see https://www.login.demo-sbi-kyc.xyz/a "
+        "and bit.ly/demo123 or demo-kyc-help@ybl again"
+    )
+    assert [(r.entity_type, r.value) for r in reportable(e)] == [
+        (U, "demo-kyc-help@ybl"),
+        (P, "+919999900001"),
+        (D, "login.demo-sbi-kyc.xyz"),
+        (L, "http://bit.ly/demo123"),
+    ]
+    # Every value is already in the form POST /report stores.
+    assert all(normalize(r.entity_type, r.value) == r.value for r in reportable(e))
 
 
 def _entity(count: int, verified: bool = False) -> ReportedEntity:

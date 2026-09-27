@@ -123,6 +123,37 @@ render.yaml                 # Render Blueprint (free native-Python web service, 
   - `pytest -q -m ""`: everything.
   - A new test that touches the DB must be marked `@pytest.mark.db`; one that calls Groq, `@pytest.mark.llm`.
 
+## Frontend
+
+- `frontend/`: Next.js 16 (App Router, Turbopack), TypeScript, Tailwind CSS v4, ESLint, npm.
+  Runtime deps are only `next`, `react`, `lucide-react` and `motion`. Ask before adding more.
+  Next 16 changed a lot: check `frontend/node_modules/next/dist/docs/` before using an API.
+- Design: neo-brutalist. Every token (colours, fonts, type scale, shadows) lives in
+  `app/globals.css` `@theme`. Verdict colours (`safe`/`suspicious`/`scam`) are for verdicts only;
+  the accent is indigo. Body text is 17px. Design for a 375px phone first, with no horizontal scroll,
+  visible focus states, and `prefers-reduced-motion` respected (`lib/useReducedMotion.ts`;
+  motion's own hook causes a hydration mismatch).
+- `NEXT_PUBLIC_API_URL` goes in `frontend/.env.local` (copy `.env.local.example`).
+  `NEXT_PUBLIC_SITE_URL` sets the absolute Open Graph URLs.
+- Commands (from `frontend/`): `npm run dev`, `npm run build`, `npm run lint`.
+
+```
+frontend/
+  app/            # layout.tsx (fonts, metadata), page.tsx (landing), check/ (checker),
+                  # r/[id]/ (shared result), globals.css (tokens), icon.svg, opengraph-image.tsx
+  components/
+    ui/           # Button, Card, Badge, SectionHeading, Container
+    site/         # Navbar, Footer, Logo, GitHubIcon, WarmUp
+    landing/      # Hero, DemoCard, WhatWeCheck, HowItWorks, CommonScams, TrustStrip, FinalCta
+    check/        # Checker (state, API calls), InputPanel (tabs), fields, examples, loading/error
+    result/       # ResultPanel and its parts (verdict + gauge, highlighted input, breakdown,
+                  # report, share), SharedResult (/r/[id])
+  lib/            # api.ts (typed client, ApiError), types.ts (mirrors backend schemas),
+                  # errors.ts (friendly messages), highlight.ts (evidence -> original text),
+                  # labels.ts, examples.ts, image.ts, useExplanationLang.ts, site.ts, cn.ts,
+                  # useReducedMotion.ts
+```
+
 ## Scope (v1): UPI and link fraud only
 
 Focus on: (1) "receive money" UPI / collect-request scams, (2) QR code scams, (3) "sent by mistake" refund scams, (4) phishing links (fake KYC/account block, electricity bill, e-challan, parcel/customs), (5) task-based job scams, (6) fake customer care numbers.

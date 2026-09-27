@@ -6,7 +6,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.core.enums import Severity, Verdict
+from app.core.enums import EntityType, Severity, Verdict
 
 
 class RedFlag(BaseModel):
@@ -40,6 +40,13 @@ class SimilarPattern(BaseModel):
     source_url: str | None = None
 
 
+class ReportableEntity(BaseModel):
+    """Something in the input a user can report with POST /report."""
+
+    entity_type: EntityType
+    value: str = Field(description="Normalized, as POST /report expects it.")
+
+
 class AnalysisResult(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -58,4 +65,8 @@ class AnalysisResult(BaseModel):
         default=None,
         description="The LLM's confidence in its explanation; 'low' if it disagreed strongly "
         "with the other signals and was overruled. None if no LLM was used.",
+    )
+    entities: list[ReportableEntity] = Field(
+        default_factory=list,
+        description="UPI IDs, phone numbers and link domains found in the input, for POST /report.",
     )

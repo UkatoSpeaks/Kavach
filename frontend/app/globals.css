@@ -45,6 +45,17 @@
   --shadow-brutal-sm: 2px 2px 0 var(--color-ink);
   --shadow-brutal: 4px 4px 0 var(--color-ink);
   --shadow-brutal-lg: 6px 6px 0 var(--color-ink);
+
+  /* Scanning line over the input while a check runs */
+  --animate-scan: scan 1.6s ease-in-out infinite alternate;
+  @keyframes scan {
+    from {
+      top: 0%;
+    }
+    to {
+      top: 100%;
+    }
+  }
 }
 
 html {

@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.enums import EntityType, Severity
 from app.db.models import ReportedEntity
 from app.db.session import SessionFactory
-from app.schemas.analysis import RedFlag
+from app.schemas.analysis import RedFlag, ReportableEntity
 from app.schemas.entities import ExtractedEntities
 from app.services.extractors import extract_phones, extract_urls
 from app.services.scoring import SignalOutcome
@@ -72,6 +72,20 @@ def entity_keys(entities: ExtractedEntities) -> list[tuple[EntityType, str]]:
         keys.append((EntityType.DOMAIN, u.host.removeprefix("www.")))
         keys.append((EntityType.DOMAIN, u.registered_domain))
     return list(dict.fromkeys(keys))
+
+
+def reportable(entities: ExtractedEntities) -> list[ReportableEntity]:
+    """What a user can report from a message: UPI IDs, phone numbers and each link's domain.
+    A shortener's domain is shared by everyone, so for those the full URL is offered instead."""
+    keys: list[tuple[EntityType, str]] = []
+    keys += [(EntityType.UPI, u.value) for u in entities.upi_ids]
+    keys += [(EntityType.PHONE, p.number) for p in entities.phones]
+    for u in entities.urls:
+        if u.is_shortener:
+            keys.append((EntityType.URL, u.url))
+        else:
+            keys.append((EntityType.DOMAIN, u.host.removeprefix("www.")))
+    return [ReportableEntity(entity_type=t, value=v) for t, v in dict.fromkeys(keys)]
 
 
 # --------------------------------------------------------------------------- DB

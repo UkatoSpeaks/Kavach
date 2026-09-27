@@ -184,6 +184,7 @@ def finish(
         advice=advice,
         similar_patterns=similar,
         confidence=confidence,
+        entities=reputation.reportable(entities),
     )
     return PipelineOutput(result=result, entities=entities, latency_ms=timer.latency)
 
