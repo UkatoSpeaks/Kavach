@@ -19,6 +19,7 @@ from app.schemas.entities import (
     SensitiveInfo,
     UPIPaymentURI,
 )
+from app.services import normalize
 
 # --------------------------------------------------------------------------- constants
 
@@ -198,12 +199,13 @@ def registered_domain(host: str) -> str:
     return ".".join(labels[-n:])
 
 
-_SENTENCE_JOIN_RE = re.compile(r"[A-Za-z]+\.[A-Z][a-z]+")
+_SENTENCE_JOIN_RE = re.compile(r"(?!www\.)[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*\.[A-Z][a-z]+")
 
 
 def _missing_space(bare: str, raw: str) -> bool:
-    """'Quiz.Win', 'home.In': a plain word, a dot, then a Capitalized everyday word, with no
-    path. 'sbi-kyc.Online', 'Bit.ly/x' and 'xyz.top' are still links."""
+    """'Quiz.Win', 'home.In', '28D.Click', 'Rs.499.Click': a word or number (a plan length,
+    an amount), a dot, then a Capitalized everyday word, with no path. 'sbi-kyc.Online',
+    'Bit.ly/x', '4ab.Click/x' and 'xyz.top' are still links."""
     return (
         raw == bare
         and _SENTENCE_JOIN_RE.fullmatch(bare) is not None
@@ -249,14 +251,40 @@ _AT_ADDRESS_RE = re.compile(
 )
 
 
+# A plain capitalized or all-caps word: "Bonus", "OFFERS". Written before "@" it is prose.
+_PROSE_WORD_RE = re.compile(r"[A-Z][a-z]+|[A-Z]{2,}")
+
+
+def _is_upi_id(local: str, handle: str) -> bool:
+    """name@handle with no dot in the handle. A known payment/bank handle always counts. An
+    unknown one only counts written in lower case after an ID-like name: in store ads
+    ("Wednesday Bonus@JioMart", "BIGGEST OFFERS@VISHAL", "Special Offer@SMART Point") "@"
+    means "at" and joins two words."""
+    if handle.lower() in KNOWN_UPI_HANDLES:
+        return True
+    return handle.islower() and _PROSE_WORD_RE.fullmatch(local) is None
+
+
+def _at_matches(text: str) -> list[tuple[re.Match[str], str]]:
+    """name@handle matches in cleaned text that are emails (dot in the handle) or UPI IDs."""
+    found = []
+    for m in _AT_ADDRESS_RE.finditer(text):
+        handle = m.group("handle")
+        if "." in handle:
+            found.append((m, "email"))
+        elif _is_upi_id(m.group("local"), handle):
+            found.append((m, "upi"))
+    return found
+
+
 def _at_addresses(text: str) -> tuple[list[ExtractedUPI], list[str]]:
     """Split name@handle tokens into UPI IDs (no dot in handle) and emails (dot in it)."""
     upis: list[ExtractedUPI] = []
     emails: list[str] = []
-    for m in _AT_ADDRESS_RE.finditer(clean_text(text)):
+    for m, kind in _at_matches(clean_text(text)):
         handle = m.group("handle").lower()
         value = f"{m.group('local').lower()}@{handle}"
-        if "." in handle:
+        if kind == "email":
             emails.append(value)
         else:
             confidence = "high" if handle in KNOWN_UPI_HANDLES else "low"
@@ -482,8 +510,24 @@ def extract_apk_files(text: str) -> list[str]:
 # --------------------------------------------------------------------------- all together
 
 
+def _protected_spans(cleaned: str) -> list[tuple[int, int]]:
+    """What leet folding must never touch: links, UPI IDs and emails, phones and amounts."""
+    spans = [m.span() for m in _UPI_URI_RE.finditer(cleaned)]
+    spans += [m.span() for m in _URL_RE.finditer(cleaned)]
+    spans += [m.span() for m, _ in _at_matches(cleaned)]
+    spans += [m.span() for m in _MOBILE_RE.finditer(cleaned)]
+    spans += [m.span() for m in _TOLL_FREE_RE.finditer(cleaned)]
+    spans += [
+        m.span()
+        for m in _AMOUNT_RE.finditer(cleaned)
+        if m.group("pre") or m.group("post") or m.group("mult") or m.group("mult_l")
+    ]
+    return spans
+
+
 def extract_entities(text: str) -> ExtractedEntities:
     cleaned = clean_text(text)
+    folded = normalize.fold(cleaned, _protected_spans(cleaned))
     urls = extract_urls(cleaned)
     upi_ids, emails = _at_addresses(cleaned)
     upi_uris = extract_upi_uris(cleaned)
@@ -510,4 +554,6 @@ def extract_entities(text: str) -> ExtractedEntities:
         remote_access_apps=detect_remote_access_apps(cleaned),
         apk_links=[u.url for u in urls if u.is_apk],
         apk_files=extract_apk_files(cleaned),
+        rule_texts=list(folded.texts),
+        evasions=list(folded.evasions),
     )

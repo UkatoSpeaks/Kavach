@@ -2,7 +2,9 @@
 and a pure check function (normalized_text, entities) -> evidence | None.
 
 Phrase lists cover English, Hinglish and Devanagari and are matched against
-ExtractedEntities.normalized_text (lower-cased, NFKC, invisible characters removed).
+ExtractedEntities.rule_texts: the normalized text (lower-cased, NFKC, invisible characters
+removed) with leetspeak folded back ("N0W" -> "now", app/services/normalize.py). Evidence is
+mapped back to the words as written, so the frontend can highlight it.
 Most text rules look for two phrase groups within a small window of clauses, so
 "PIN" in one message and "receive" three paragraphs later does not count.
 """
@@ -12,6 +14,7 @@ import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
+from app.core.config import RULE_WEIGHTS, SUPPORTING_ONLY_MAX_SCORE, SUPPORTING_RULES
 from app.core.enums import ScamType
 from app.schemas.entities import ExtractedEntities, ExtractedURL
 
@@ -40,6 +43,7 @@ class RuleResult:
     score: int  # 0-100
     scam_type: ScamType | None
     type_weights: dict[ScamType, float] = field(default_factory=dict)
+    supporting_only: bool = False  # only SUPPORTING_RULES fired: score capped
 
     @property
     def max_weight(self) -> float:
@@ -226,6 +230,32 @@ AI_MANIPULATION = [
     rf"\b(?:isko|ise|is message ko)\b{_GAP}\bsafe\b{_GAP}\b(?:mark|batao|bolo|likho|dikhao)",
     "पिछले निर्देश", "निर्देशों को अनदेखा", "सुरक्षित मार्क",
 ]  # fmt: skip
+# A big credit or win that has "arrived", and a link to cash it out.
+FAKE_CREDIT = [
+    r"(?<!to be )(?<!will be )\bcredited\b", r"\breceived?\b", r"\bdeposited\b",
+    r"\badded (?:to|in|into) (?:your |ur )?(?:wallet|account|a/c|acc?t?)\b",
+    r"\btransaction (?:is |was |has been )?success(?:ful(?:ly)?)?\b",
+    r"\bsuccessfully (?:credited|transferred|done|added)\b",
+]  # fmt: skip
+CASH_OUT = [
+    r"\bwithdraw(?:al)?\b", r"\bget (?:the |your )?cash\b", r"\bcash ?out\b",
+    r"\b(?:move|transfer)\w* (?:\w+ ){0,2}?to (?:your |ur )?bank\b",
+    r"\bdirect(?:ly)? (?:to )?(?:your |ur )?(?:bank|a/c|ac|account)\b",
+    r"\bclaim(?: it)? now\b", r"\bto claim\b",
+    r"\bclaim (?:your|the|it|bonus|cash|reward|amount|money|prize)\b",
+]  # fmt: skip
+# An offer that needs a deposit first is an ad (betting "bonus on first deposit").
+DEPOSIT_FIRST = [r"\bfirst deposit\b", r"\bon (?:a |your )?deposit\b"]
+FAKE_CREDIT_MIN = 1000  # promos say "Rs.250 credited as cash points"; these claim more
+# "Rs.44,OOO": the scams write letter O for zero in amounts too. Possessive, so "rs.500off"
+# is not read as 5000.
+_AMOUNT_WITH_O = re.compile(r"(?:₹|\brs\.?|\binr)\s*(\d[\d,o]*+)(?![a-z])")
+# "OI1.in/2vclen!8cpr814": a letter or digit, "!", then a code with a digit in it. Not
+# Flipkart's "fkrt.it/!..." (the "!" right after the slash).
+_TRACKING_SUFFIX = re.compile(r"[A-Za-z0-9]!(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{4,}(?![A-Za-z0-9])")
+# Real services whose 3-5 character domain name mixes letters and digits.
+KNOWN_DIGIT_DOMAINS = frozenset({"1mg.com", "zee5.com", "a23.games", "a23.com"})
+
 ID_DOCS = [r"\baadhaa?r\b", r"\badhaa?r\b", r"\bpan\b", "आधार", "पैन"]
 DOC_VERBS = SHARE_VERBS + [r"\bupload\b", r"\bupdate\b", r"\bsubmit\b", r"\bverify\b", "अपडेट"]
 
@@ -271,6 +301,7 @@ BRAND_OFFICIAL_DOMAINS: dict[str, frozenset[str]] = {
         "fedex": {"fedex.com"},
     }.items()
 }  # fmt: skip
+_OFFICIAL_DOMAINS = frozenset().union(*BRAND_OFFICIAL_DOMAINS.values())
 # Brands that are also ordinary words one typo away ("delivery") only match exactly.
 NO_FUZZY_BRANDS = frozenset({"delhivery"})
 # Only government bodies / banks can register these, so they are never lookalikes.
@@ -585,6 +616,50 @@ def _ai_manipulation_attempt(text: str, e: ExtractedEntities) -> str | None:
     return _find(text, AI_MANIPULATION)
 
 
+def largest_amount(text: str, e: ExtractedEntities) -> float:
+    """Largest amount mentioned, counting "Rs.51OOO" (letter O for zero) as 51000."""
+    folded = [float(m.group(1).replace(",", "").replace("o", "0"))
+              for m in _AMOUNT_WITH_O.finditer(text)]  # fmt: skip
+    return max([a.value for a in e.amounts] + folded, default=0.0)
+
+
+def _fake_credit_alert(text: str, e: ExtractedEntities) -> str | None:
+    if not e.urls or _all_links_official(e) or _find(text, DEPOSIT_FIRST):
+        return None
+    credit, cash_out = _find(text, FAKE_CREDIT), _find(text, CASH_OUT)
+    if credit and cash_out and largest_amount(text, e) >= FAKE_CREDIT_MIN:
+        return f"{credit} … {cash_out}"
+    return None
+
+
+def _tracking_suffix_link(text: str, e: ExtractedEntities) -> str | None:
+    for u in e.urls:
+        path = u.url[u.url.find(u.host) + len(u.host) :]
+        if u.registered_domain not in _OFFICIAL_DOMAINS and _TRACKING_SUFFIX.search(path):
+            return u.raw
+    return None
+
+
+def throwaway_name(url: ExtractedURL) -> bool:
+    """A 3-5 character domain name mixing letters and digits: 9lp7.com, OI1.in."""
+    name = url.registered_domain.split(".", 1)[0]
+    return (
+        3 <= len(name) <= 5
+        and re.search(r"\d", name) is not None
+        and re.search(r"[a-z]", name) is not None
+        and not url.is_shortener
+        and url.registered_domain not in KNOWN_DIGIT_DOMAINS
+    )
+
+
+def _throwaway_domain(text: str, e: ExtractedEntities) -> str | None:
+    return next((u.raw for u in e.urls if throwaway_name(u)), None)
+
+
+def _filter_evasion(text: str, e: ExtractedEntities) -> str | None:
+    return " … ".join(e.evasions[:3]) or None
+
+
 # =========================================================================== the rules
 
 T = ScamType
@@ -620,8 +695,20 @@ RULES: tuple[Rule, ...] = (
     Rule("money_back_request", "Asks you to send money back",
          "पैसे वापस भेजने को कहा गया है", T.SENT_BY_MISTAKE, 0.2, _money_back_request),
     # --- phishing links / fake notices
+    Rule("fake_credit_alert",
+         "Claims a large amount was credited to you and gives a link to withdraw it",
+         "बड़ी रकम जमा होने का दावा और उसे निकालने के लिए लिंक दिया गया है", T.PHISHING_LINK,
+         RULE_WEIGHTS["fake_credit_alert"], _fake_credit_alert),
     Rule("short_url", "Uses a shortened link that hides the real website",
-         "छोटा (शॉर्ट) लिंक है जो असली वेबसाइट छुपाता है", T.PHISHING_LINK, 0.45, _short_url),
+         "छोटा (शॉर्ट) लिंक है जो असली वेबसाइट छुपाता है", T.PHISHING_LINK,
+         RULE_WEIGHTS["short_url"], _short_url),
+    Rule("tracking_suffix_link",
+         "Link ends in a per-recipient code after '!', as bulk scam campaigns use",
+         "लिंक के आखिर में '!' के बाद हर व्यक्ति के लिए अलग कोड है, जैसा ठगी वाले मैसेज में होता है",
+         T.PHISHING_LINK, RULE_WEIGHTS["tracking_suffix_link"], _tracking_suffix_link),
+    Rule("throwaway_domain", "Link uses a short, random-looking domain name (like 9lp7.com)",
+         "लिंक का डोमेन छोटा और बेतरतीब है (जैसे 9lp7.com)", T.PHISHING_LINK,
+         RULE_WEIGHTS["throwaway_domain"], _throwaway_domain),
     Rule("lookalike_domain", "Link imitates a bank, brand or government website",
          "लिंक किसी बैंक, कंपनी या सरकारी वेबसाइट की नकल है", T.PHISHING_LINK, 0.6,
          _lookalike_domain),
@@ -669,6 +756,10 @@ RULES: tuple[Rule, ...] = (
     Rule("id_document_request", "Asks you to share or update Aadhaar/PAN details",
          "आधार/पैन की जानकारी भेजने या अपडेट करने को कहा गया है", T.GENERIC, 0.35,
          _id_document_request),
+    Rule("filter_evasion",
+         "Writes words with digits or odd capitals (N0W, yOur) to slip past spam filters",
+         "स्पैम फ़िल्टर से बचने के लिए शब्दों में अंक या अजीब बड़े अक्षर लिखे गए हैं (N0W, yOur)",
+         T.GENERIC, RULE_WEIGHTS["filter_evasion"], _filter_evasion),
     # Weight 0.8: with any other scam sign (e.g. a UPI ID) it reaches "scam" without the LLM,
     # whose judgement is exactly what the message tries to hijack.
     Rule("ai_manipulation_attempt",
@@ -687,13 +778,32 @@ def saturating_score(weights: Iterable[float]) -> int:
     return round(100 * (1 - math.prod(1 - w for w in weights)))
 
 
+# Separators rule evidence joins its pieces with ("clause . clause", "phrase … entity").
+_EVIDENCE_JOINS = re.compile(r"( \. | … |…)")
+
+
+def _unfold(evidence: str, folded: str, original: str) -> str:
+    """Evidence found in a folded text, as written in the original ("withdraw n0w", not
+    "withdraw now"). Folding keeps positions, so each piece maps back by index."""
+    if folded == original:
+        return evidence
+    out = []
+    for piece in _EVIDENCE_JOINS.split(evidence):
+        at = folded.find(piece) if piece and not _EVIDENCE_JOINS.fullmatch(piece) else -1
+        out.append(original[at : at + len(piece)] if at >= 0 else piece)
+    return "".join(out)
+
+
 def evaluate(entities: ExtractedEntities, rules: Iterable[Rule] = RULES) -> RuleResult:
-    text = entities.normalized_text
-    hits = [
-        RuleHit(rule, evidence)
-        for rule in rules
-        if (evidence := rule.check(text, entities)) is not None
-    ]
+    rules = tuple(rules)
+    original = entities.normalized_text
+    texts = [t for t in entities.rule_texts if len(t) == len(original)] or [original]
+    found: dict[str, RuleHit] = {}
+    for text in texts:  # the 1->l copy only adds rules the 1->i copy missed
+        for rule in rules:
+            if rule.id not in found and (evidence := rule.check(text, entities)) is not None:
+                found[rule.id] = RuleHit(rule, _unfold(evidence, text, original))
+    hits = [found[r.id] for r in rules if r.id in found]
     hits.sort(key=lambda h: h.rule.weight, reverse=True)
 
     type_weights: dict[ScamType, float] = {}
@@ -706,11 +816,16 @@ def evaluate(entities: ExtractedEntities, rules: Iterable[Rule] = RULES) -> Rule
     pool = specific or type_weights
     scam_type = max(pool, key=lambda t: (pool[t], _max_weight(hits, t))) if pool else None
 
+    score = saturating_score(h.rule.weight for h in hits)
+    supporting_only = bool(hits) and all(h.rule.id in SUPPORTING_RULES for h in hits)
+    if supporting_only:
+        score = min(score, SUPPORTING_ONLY_MAX_SCORE)
     return RuleResult(
         hits=hits,
-        score=saturating_score(h.rule.weight for h in hits),
+        score=score,
         scam_type=scam_type,
         type_weights=type_weights,
+        supporting_only=supporting_only,
     )
 
 

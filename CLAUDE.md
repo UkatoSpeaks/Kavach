@@ -55,7 +55,10 @@ backend/
     schemas/                # analysis.py (AnalysisResult), entities.py
     services/
       extractors.py         # URLs, UPI IDs, upi:// URIs, phones, amounts, sensitive-info mentions
-      rules.py              # weighted rule engine
+      normalize.py          # leetspeak folding for the rules (N0W -> now), never inside
+                            # links/IDs/amounts/codes; evasion tokens for filter_evasion
+      rules.py              # weighted rule engine (weights of the link/evasion rules and the
+                            # supporting-only cap are in core/config.py)
       upi.py                # UPI ID + upi:// URI analysis
       qr.py                 # QR decode
       url_intel.py          # link expansion (SSRF-safe), RDAP domain age, Safe Browsing

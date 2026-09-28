@@ -90,7 +90,10 @@ def rules_signal(result: RuleResult, informative_if_empty: bool = True) -> Signa
             return SignalOutcome("rules", 0, "no rules matched")
         return SignalOutcome("rules", 0, "no rules matched (no message text)", informative=False)
     ids = ", ".join(h.rule.id for h in result.hits)
-    return SignalOutcome("rules", result.score, f"{len(result.hits)} rule(s) matched: {ids}")
+    detail = f"{len(result.hits)} rule(s) matched: {ids}"
+    if result.supporting_only:
+        detail += "; only weak signs, common in ads too: score capped"
+    return SignalOutcome("rules", result.score, detail)
 
 
 def combine_signals(

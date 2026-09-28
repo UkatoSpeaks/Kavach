@@ -16,8 +16,17 @@ backend/data/datasets/raw/
 # Your collected messages (personal data, not anonymized) and everything derived from them.
 backend/data/datasets/collected/
 backend/data/datasets/synthetic/
+# Real messages to label by hand (ml/prepare_dataset.py) and your applied labels (ml/apply_review.py).
+backend/data/datasets/review_queue.csv
+backend/data/datasets/reviewed_labels.csv
+# AI-assisted labels to double-check (ml/apply_review.py).
+backend/data/datasets/review_low_confidence.csv
 backend/data/datasets/processed/*
 !backend/data/datasets/processed/.gitkeep
+# Evaluation reports that quote your collected messages (ml/evaluate.py writes those to
+# ml/reports/private/ and refuses paths git would track).
+backend/ml/reports/private/
+backend/ml/reports/*collected*
 
 # Editors / OS
 .vscode/

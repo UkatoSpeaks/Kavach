@@ -10,6 +10,26 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 
+# Rule weights (0-1) for the link and filter-evasion rules; the other rules keep theirs next
+# to their checks in app/services/rules.py. Rule scores combine as 1 - prod(1 - w).
+RULE_WEIGHTS: dict[str, float] = {
+    # "Rs.82,850 credited ... GET Cash NOW <link>": a big fake credit with a cash-out link.
+    "fake_credit_alert": 0.75,
+    "short_url": 0.45,
+    # "9lp7.com/tul8vf!88a6j7d": a per-recipient code after "!". Alone it stays below
+    # "suspicious" (35); with a throwaway domain it does not.
+    "tracking_suffix_link": 0.30,
+    # Below 0.35 on purpose: only meaningful together with other signs.
+    "throwaway_domain": 0.25,
+    "filter_evasion": 0.15,
+}
+# Signs that are common in ordinary promotions too (short links, odd spellings). When only
+# these fire, the rules score is capped at SUPPORTING_ONLY_MAX_SCORE, low enough that even a
+# full pattern-similarity match stays below "suspicious"; next to any other rule they count
+# with their full weight.
+SUPPORTING_RULES = frozenset({"short_url", "throwaway_domain", "filter_evasion"})
+SUPPORTING_ONLY_MAX_SCORE = 20
+
 
 def _normalize_database_url(url: str) -> str:
     """Force the asyncpg driver and percent-encode the password.

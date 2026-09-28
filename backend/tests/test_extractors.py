@@ -98,6 +98,11 @@ def test_no_false_urls(text: str) -> None:
         "will be? Txt her first name to 82277.unsub STOP £1.50 008704050406 SP Arrow",
         "Offer ends today.Call now",
         "Reached home.In the car now",
+        # a number or code before the full stop (invented examples)
+        "Get 2GB/day, valid 84D.Click the link below to recharge",
+        "Unlimited calls for 56D.Shop now at the nearest store",
+        "Pay Rs.499.Click here to know more",
+        "Order 3X.Click to track your points",
     ],
 )
 def test_missing_space_after_full_stop_is_not_a_url(text: str) -> None:
@@ -112,6 +117,9 @@ def test_missing_space_after_full_stop_is_not_a_url(text: str) -> None:
         ("Visit Sbi-Kyc.Online now", "http://sbi-kyc.online"),  # hyphen: a real domain
         ("Claim at Free.Win/prize", "http://free.win/prize"),  # has a path
         ("Claim at https://Quiz.Win", "https://quiz.win"),  # has a scheme
+        ("Withdraw at 4ab.Click/x now", "http://4ab.click/x"),  # has a path
+        ("Withdraw at k3z9.click now", "http://k3z9.click"),  # lower-case TLD
+        ("Open www.Deals.Shop now", "http://www.deals.shop"),  # www.
     ],
 )
 def test_bare_domains_still_found(text: str, url: str) -> None:
@@ -154,6 +162,60 @@ def test_registered_domain(host: str, expected: str) -> None:
 def test_extract_upi_ids(text: str, value: str, confidence: str) -> None:
     (upi,) = extract_upi_ids(text)
     assert (upi.value, upi.confidence) == (value, confidence)
+
+
+# India Spam SMS (public, MIT): store ads in which "@" means "at". All 11 were read as UPI
+# IDs with an unknown handle (upi_unknown_handle) before.
+STORE_ADS_WITH_AT = [
+    "Durga Puja Special Offer@SMART Point Store,BOGO Bikaji Gulab Jamun 1Kg,B2G1 Bingo Potato "
+    "Chilli Chip 60g,Good Life Mix Dry Fruits 500g Rs 279, bit.ly/3cbREQe TC",
+    "Wednesday Bonus@JioMart,Bangalore!Onion Rs 27/Kg,Sweet Corn Rs 14/Pc,Papaya Rs 27/Kg,Also "
+    "at SMART &SMART Point store bit.ly/3iLAjlj 28Jul,TC",
+    "FRESH WEDNESDAY@STAR Varmahalakshmi Special Offer: Coconut@18/Pc Sweet Lime@29/Kg Banana "
+    "Yellaki@79/Kg Apple Shimla@99/Pk More: bit.ly/3OMdrju T&C",
+    "Wednesday Bonus@JioMart,Bangalore!Onion Rs 37/Kg,Cucumber Rs 21/Kg,Banana Yellaki 12Pc Pk "
+    "Rs 42/Kg,Also at SMART &SMART Point store bit.ly/3p9qmRT 1Dec,TC",
+    "Wednesday Bonus@JioMart,Bangalore!Onion Rs 29/Kg,Pear Indian Rs 89/Kg,Cabbage Rs 12/Pc,"
+    "Also at SMART &SMART Point store bit.ly/3yk4kiC 4Aug,TC",
+    "Wednesday Bonus@JioMart,Bangalore!Onion Rs 27/Kg,Sweet Corn Rs 10/Pc,Apple Simla Rs "
+    "115/Kg,Also at SMART &SMART Point store bit.ly/3hOTf2S 22Sep,TC",
+    "Wednesday Bonus@JioMart,Bangalore!Onion Rs 44/Kg,Sweet Corn Rs 12/Pc,Apple Simla Rs "
+    "134/Kg,Also at SMART &SMART Point store bit.ly/3xeY8ZE 24Nov,TC",
+    "Bestival Sales@SMART Point Store,BA1GA1 Snactac/Bikaji Gulab Jamun/ Rasgulla 1Kg,B2G1 "
+    "Cadbury Dairy Milk Home Pk 126g,30%OFF Tide PWDR,Click bit.ly/2VxhKY9 TC",
+    "Wednesday Bonus@JioMart,Bangalore!Onion Rs 28/Kg,Cucumber Rs 14/Kg,Water Melon Kiran Rs "
+    "15/Kg,Also at SMART &SMART Point store bit.ly/2Wmh3ng 29Sep,TC",
+    "Wednesday Bonus@JioMart,Bangalore!Onion Rs 27/Kg,Apple Simla Rs 139/Kg,Cucumber Rs 19/Kg,"
+    "Also at SMART &SMART Point store bit.ly/385FTKd 25Aug,TC",
+    "Wednesday Bonus@JioMart,Bangalore!Onion Rs 41/Kg,Sweet Corn Rs 8/Pc,Banana Robusta Box "
+    "(6Pc) Rs 29,Also at SMART &SMART Point store bit.ly/3ESiOJm 10Nov,TC",
+]
+
+
+@pytest.mark.parametrize("text", STORE_ADS_WITH_AT)
+def test_word_at_store_is_not_a_upi_id(text: str) -> None:
+    assert extract_upi_ids(text) == []
+
+
+@pytest.mark.parametrize(
+    ("text", "value", "confidence"),
+    [
+        ("Pay Rahul@YBL now", "rahul@ybl", "high"),  # known handle: any case
+        ("Refund via Offer@jio", "offer@jio", "high"),
+        ("send to kbc.lottery99@okfam", "kbc.lottery99@okfam", "low"),
+        ("send to winner@luckypay", "winner@luckypay", "low"),  # lower case: an ID
+    ],
+)
+def test_upi_ids_that_still_count(text: str, value: str, confidence: str) -> None:
+    (upi,) = extract_upi_ids(text)
+    assert (upi.value, upi.confidence) == (value, confidence)
+
+
+@pytest.mark.parametrize(
+    "text", ["Sale@SMART Point", "Pay at Refund@PaytmHelp", "BIG DEALS@VISHAL"]
+)
+def test_unknown_capitalized_handles_are_not_upi_ids(text: str) -> None:
+    assert extract_upi_ids(text) == []
 
 
 def test_email_is_not_upi() -> None:
@@ -465,7 +527,9 @@ def test_genuine_amazon_delivery() -> None:
 
 
 def test_extracted_entities_is_json_serializable() -> None:
-    e = extract_entities("Pay ₹500 to x@ybl at bit.ly/x, call 9876543210, share OTP")
+    e = extract_entities("Pay ₹500 to x@ybl at bit.ly/x, call 9876543210, share OTP N0W")
     dumped = e.model_dump(mode="json")
+    assert "rule_texts" not in dumped and "evasions" not in dumped  # rules only, not stored
+    assert e.evasions == ["N0W"]
     assert dumped["sensitive_info"] == ["otp"]
     assert dumped["upi_ids"][0]["confidence"] == "high"

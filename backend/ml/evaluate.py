@@ -19,13 +19,21 @@ public datasets' "spam"/"smishing" (NOT the same thing as our "scam"; see the re
 
     uv run python -m ml.evaluate --dataset examples
     uv run python -m ml.evaluate --dataset uci
+    uv run python -m ml.evaluate --dataset india --modes checks   # ham / promo FPR
+    uv run python -m ml.evaluate --dataset collected --modes checks   # every message
     uv run python -m ml.evaluate --dataset test --modes rules,checks,llm --llm-limit 30
     uv run python -m ml.evaluate --dataset path/to/file.csv --name my_set   # text,label
+
+Reports quote messages. A set that contains your collected messages (any row with dataset
+"collected": collected, and the val/test splits) or a custom CSV is written to
+ml/reports/private/ (gitignored), and --out must be a path git ignores or one outside the
+repository.
 """
 
 import argparse
 import asyncio
 import hashlib
+import json
 import statistics
 import subprocess
 import sys
@@ -33,7 +41,7 @@ import time
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import AsyncExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -46,7 +54,11 @@ from app.services.agent.llm import GroqReasoner, LRUTTLCache, Reasoner
 from app.services.cache import LookupCache
 from app.services.embeddings import FastEmbedder
 from app.services.knowledge_base import load_docs
+from ml.autolabel import UNCERTAIN
 from ml.common import OOD_LABELS, PROCESSED_DIR, REPORTS_DIR, guess_language, read_csv
+
+# Reports that quote your collected messages. Gitignored (see the repository .gitignore).
+PRIVATE_REPORTS_DIR = REPORTS_DIR / "private"
 
 FLAGGED = {Verdict.SUSPICIOUS, Verdict.SCAM}
 MODES = ("rules", "checks", "llm")
@@ -60,9 +72,12 @@ class Item:
     id: str
     text: str
     positive: bool
-    group: str  # scam_type for positives when known, else the original label
+    group: str  # scam_type for positives when known, else the original label; for
+    # negatives the label (genuine, promo_spam)
     language: str
     scam_type: str = ""
+    label: str = ""
+    label_source: str = ""  # manual | dataset | auto | synthetic (processed CSVs)
 
 
 @dataclass(frozen=True)
@@ -71,6 +86,8 @@ class EvalSet:
     items: list[Item]
     caveat: str
     positive_desc: str
+    private: bool = False  # quotes your collected messages: report kept out of git
+    notes: tuple[str, ...] = ()  # printed in every report (e.g. the test split's history)
 
 
 EXAMPLES_CAVEAT = (
@@ -87,7 +104,22 @@ UCI_CAVEAT = (
     "recall** and a low number is expected. The meaningful number here is the **false "
     "positive rate on ham**: how often ordinary messages get flagged."
 )
-INDIAN_CAVEAT = "Real, collected, anonymized Indian messages (no synthetic data in val/test)."
+INDIAN_CAVEAT = (
+    "Real, anonymized Indian messages with reviewed labels: your collected messages and India "
+    "Spam SMS rows labelled by you (manual) or by an AI assistant (assisted, Claude). Metrics "
+    "are shown for each label source and combined. No synthetic data in val/test."
+)
+INDIA_SPAM_CAVEAT = (
+    "**Real Indian SMS** (India Spam SMS Classification, MIT). `genuine` = the dataset's own "
+    "ham label. `scam` and `promo_spam` are mostly **auto labels** from ml/autolabel.py, which "
+    "uses these same rules, so recall on auto-labelled scams is circular and inflated: read "
+    "the **false-positive rates** (ham, and promo spam) below, not recall. Reviewed rows "
+    "count as label_source manual (you) or assisted (Claude). Uncertain rows are left out."
+)
+COLLECTED_CAVEAT = (
+    "**Your collected messages** (anonymized), every one, labelled by you. Too few for a "
+    "rate to mean much: read the per-message table."
+)
 
 
 def _item(i: int, text: str, positive: bool, group: str, scam_type: str = "") -> Item:
@@ -105,19 +137,35 @@ def load_examples() -> EvalSet:
     return EvalSet("examples", items, EXAMPLES_CAVEAT, "the scam examples")
 
 
-def load_csv_set(path: Path, name: str, caveat: str) -> EvalSet:
+def load_csv_set(path: Path, name: str, caveat: str, private: bool = False) -> EvalSet:
+    """`private`: treat as personal data even if no row says it comes from collected/."""
     items = []
     for i, r in enumerate(read_csv(path)):
+        private = private or (r.get("dataset") or "").strip() == "collected"
         label = (r.get("label") or "").strip().lower()
+        if label == UNCERTAIN:  # auto-labeller undecided: no ground truth
+            continue
         original = (r.get("original_label") or label).strip().lower()
         positive = label == "scam" or label in OOD_LABELS
         scam_type = (r.get("scam_type") or "").strip()
-        group = (scam_type or original or label) if positive else "genuine"
+        # promo_spam is not a scam (a negative), but keeps its own group so its
+        # false-positive rate shows separately from genuine messages.
+        group = (scam_type or original or label) if positive else (label or "genuine")
         lang = r.get("language") or guess_language(r["text"])
-        items.append(Item(r.get("id") or str(i), r["text"], positive, group, lang, scam_type))
+        items.append(Item(r.get("id") or str(i), r["text"], positive, group, lang, scam_type,
+                          label, (r.get("label_source") or "").strip()))  # fmt: skip
     ood = any(it.group in OOD_LABELS for it in items)
     desc = 'original label spam/smishing (not our "scam")' if ood else "label scam"
-    return EvalSet(name, items, caveat, desc)
+    return EvalSet(name, items, caveat, desc, private)
+
+
+def test_split_notes() -> tuple[str, ...]:
+    """Notes about the frozen test split, kept in split_manifest.json ("notes"): they stay
+    with the split until it is re-drawn (prepare_dataset --rebuild-test)."""
+    path = PROCESSED_DIR / "split_manifest.json"
+    if not path.exists():
+        return ()
+    return tuple(json.loads(path.read_text(encoding="utf-8")).get("notes", []))
 
 
 def load_eval_set(dataset: str) -> EvalSet:
@@ -130,6 +178,8 @@ def load_eval_set(dataset: str) -> EvalSet:
                      "data/datasets/README.md for its caveats."),
         "test": ("test.csv", INDIAN_CAVEAT + " The frozen test split."),
         "val": ("val.csv", INDIAN_CAVEAT + " The validation split."),
+        "india": ("india_spam_sms.csv", INDIA_SPAM_CAVEAT),
+        "collected": ("collected.csv", COLLECTED_CAVEAT),
     }  # fmt: skip
     if dataset in named:
         file, caveat = named[dataset]
@@ -137,11 +187,15 @@ def load_eval_set(dataset: str) -> EvalSet:
         if not path.exists():
             sys.exit(f"{path} not found. Run: uv run python -m ml.prepare_dataset "
                      "(and ml.download_public for uci)")  # fmt: skip
-        return load_csv_set(path, dataset, caveat)
+        es = load_csv_set(path, dataset, caveat)
+        if dataset == "test":
+            es = replace(es, notes=test_split_notes())
+        return es
     path = Path(dataset)
     if not path.exists():
-        sys.exit(f"unknown dataset {dataset!r}: use examples|uci|mendeley|test|val or a CSV path")
-    return load_csv_set(path, path.stem, "Custom CSV.")
+        sys.exit(f"unknown dataset {dataset!r}: use {'|'.join(['examples', *named])} or a "
+                 "CSV path")  # fmt: skip
+    return load_csv_set(path, path.stem, "Custom CSV.", private=True)  # may be your messages
 
 
 # ----------------------------------------------------------------------------- running
@@ -334,6 +388,60 @@ def _breakdown(preds: Sequence[Prediction], key: Callable[[Item], str], title: s
     return lines
 
 
+def _negative_fpr(preds: Sequence[Prediction]) -> list[str]:
+    """False-positive rate per not-scam label and who labelled it (genuine from the
+    dataset, promo_spam from the auto-labeller, ...). Empty for sets without labels."""
+    groups: dict[tuple[str, str], list[Prediction]] = defaultdict(list)
+    for p in preds:
+        if p.result is not None and not p.item.positive and p.item.label:
+            groups[(p.item.label, p.item.label_source or "–")].append(p)
+    if not groups:
+        return []
+    lines = [
+        "| not-scam label | labelled by | n | flagged | FPR | of which verdict scam |",
+        "|---|---|---:|---:|---:|---:|",
+    ]
+    for (label, source), g in sorted(groups.items()):
+        flagged = sum(p.flagged for p in g)
+        scam = sum(is_scam(p) for p in g)
+        lines.append(f"| {label} | {source} | {len(g)} | {flagged} | {pct(flagged / len(g))} "
+                     f"| {scam} |")  # fmt: skip
+    return lines
+
+
+PER_MESSAGE_MAX = 100  # sets this small get a table of every message
+
+
+def _outcome(p: Prediction) -> str:
+    if p.item.positive and not p.flagged:
+        return "**MISSED**"
+    if not p.item.positive and p.flagged:
+        return "**FALSE ALARM**"
+    return "ok"
+
+
+def _per_message(preds: Sequence[Prediction]) -> list[str]:
+    lines = [
+        "| # | expected | score | verdict | outcome | top signals | message |",
+        "|---:|---|---:|---|---|---|---|",
+    ]
+    for n, p in enumerate(preds, 1):
+        expected = p.item.label or ("scam" if p.item.positive else "genuine")
+        if p.item.scam_type:
+            expected += f" ({p.item.scam_type})"
+        if p.result is None:
+            lines.append(f"| {n} | {expected} | – | error | {p.error} | | "
+                         f"{_one_line(p.item.text, 160)} |")  # fmt: skip
+            continue
+        flags = ", ".join(f.code for f in p.result.red_flags) or "none"
+        lines.append(
+            f"| {n} | {expected} | {p.result.risk_score} | {p.result.verdict.value} | "
+            f"{_outcome(p)} | {top_signals(p.result)}; flags: {flags} | "
+            f"{_one_line(p.item.text, 160)} |"
+        )
+    return lines
+
+
 def _mistakes(preds: Sequence[Prediction]) -> tuple[list[Prediction], list[Prediction]]:
     fps = sorted(
         (p for p in preds if p.result and not p.item.positive and p.flagged),
@@ -368,6 +476,59 @@ def _git_rev() -> str:
         return "unknown"
 
 
+def git_would_track(path: Path) -> bool:
+    """True if `path` is inside this repository and not gitignored (or already tracked)."""
+    try:
+        r = subprocess.run(["git", "check-ignore", "-q", str(path.resolve())],
+                           cwd=REPORTS_DIR.parent, capture_output=True)  # fmt: skip
+    except OSError:  # no git: only the private folder counts as safe
+        return not path.resolve().is_relative_to(PRIVATE_REPORTS_DIR.resolve())
+    # 0: ignored. 1: not ignored (tracked files never count as ignored). 128: outside the
+    # repository, or not a repository at all.
+    return r.returncode == 1
+
+
+def report_path(es: EvalSet, name: str, out: str | None) -> Path:
+    if out:
+        path = Path(out)
+        if es.private and git_would_track(path):
+            sys.exit(f"{path}: this report quotes your collected messages and git would "
+                     f"track it. Leave out --out (it goes to {PRIVATE_REPORTS_DIR}) or pick "
+                     "a gitignored path.")  # fmt: skip
+        return path
+    folder = PRIVATE_REPORTS_DIR if es.private else REPORTS_DIR
+    return folder / f"{date.today().isoformat()}_{name}.md"
+
+
+REVIEWED = ("manual", "assisted")
+
+
+def label_note(es: EvalSet, name: str) -> str | None:
+    """'Test labels: N manual (author), M AI-assisted (Claude)' for sets with reviewed
+    labels; None for sets labelled only by a dataset or the auto-labeller."""
+    sources = [it.label_source for it in es.items]
+    if not any(src in REVIEWED for src in sources):
+        return None
+    what = "Test labels" if name == "test" else "Labels"
+    note = (f"{what}: {sources.count('manual')} manual (author), "
+            f"{sources.count('assisted')} AI-assisted (Claude)")  # fmt: skip
+    if other := len(sources) - sources.count("manual") - sources.count("assisted"):
+        note += f", {other} from the dataset or the auto-labeller"
+    return note
+
+
+def by_label_source(label: str, preds: Sequence[Prediction]) -> list[tuple[str, list[Prediction]]]:
+    """(row label, predictions): combined, then manual-only and assisted-only when the set
+    mixes the two, so AI-assisted labels never hide inside one number."""
+    groups = [(label, list(preds))]
+    manual = [p for p in preds if p.item.label_source == "manual"]
+    assisted = [p for p in preds if p.item.label_source == "assisted"]
+    if assisted:
+        groups = [(f"{label} · combined", list(preds)), (f"{label} · manual labels", manual),
+                  (f"{label} · AI-assisted labels", assisted)]  # fmt: skip
+    return groups
+
+
 def render(es: EvalSet, runs: list[ModeRun], settings: Settings, network: bool, name: str) -> str:
     pos = sum(it.positive for it in es.items)
     lines = [
@@ -382,13 +543,15 @@ def render(es: EvalSet, runs: list[ModeRun], settings: Settings, network: bool, 
         f"- weights: `{settings.SIGNAL_WEIGHTS}` · thresholds: suspicious ≥ "
         f"{settings.VERDICT_SUSPICIOUS_MIN}, scam ≥ {settings.VERDICT_SCAM_MIN}",
         '- flagged = verdict suspicious or scam. "scam-only" counts only verdict scam.',
+        *([f"- **{note}**"] if (note := label_note(es, name)) else []),
+        *(f"- **Note:** {n}" for n in es.notes),
         "",
         "## Summary",
         "",
         METRICS_HEADER,
     ]
     for run in runs:
-        lines.append(_metrics_row(run.mode, run.preds))
+        lines += [_metrics_row(label, g) for label, g in by_label_source(run.mode, run.preds)]
         if run.same_sample_checks:
             lines.append(_metrics_row("checks (same sample as llm)", run.same_sample_checks))
     for run in runs:
@@ -397,6 +560,10 @@ def render(es: EvalSet, runs: list[ModeRun], settings: Settings, network: bool, 
         if run.note:
             lines += [run.note, ""]
         lines += ["### Confusion matrix", "", *_confusion(run.preds), ""]
+        if fpr_lines := _negative_fpr(run.preds):
+            lines += ["### False-positive rate per not-scam label", "", *fpr_lines, ""]
+        if len(run.preds) <= PER_MESSAGE_MAX:
+            lines += ["### Every message", "", *_per_message(run.preds), ""]
         lines += ["### Per group (scam_type, or the dataset's own label)", ""]
         lines += [*_breakdown(run.preds, lambda it: it.group, "group"), ""]
         lines += ["### Per language (heuristic)", ""]
@@ -426,6 +593,7 @@ async def run(args: argparse.Namespace) -> None:
     if args.limit:
         es.items[:] = es.items[: args.limit]
     name = args.name or es.name
+    out = report_path(es, name, args.out)  # before the run: a refused path fails fast
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     if bad := [m for m in modes if m not in MODES]:
         sys.exit(f"unknown mode(s) {bad}; choose from {MODES}")
@@ -486,15 +654,22 @@ async def run(args: argparse.Namespace) -> None:
             same = [checks_preds[it.id] for it in sample if it.id in checks_preds]
             runs.append(ModeRun("llm (full pipeline)", preds, note, same))
 
-    out = Path(args.out) if args.out else REPORTS_DIR / f"{date.today().isoformat()}_{name}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(render(es, runs, settings, args.network, name), encoding="utf-8")
     print(f"\nreport: {out}\n")
+    if note := label_note(es, name):
+        print(note + "\n")
+    for n in es.notes:
+        print(f"Note: {n}\n")
     print(METRICS_HEADER)
     for r in runs:
-        print(_metrics_row(r.mode, r.preds))
+        for label, g in by_label_source(r.mode, r.preds):
+            print(_metrics_row(label, g))
         if r.same_sample_checks:
             print(_metrics_row("checks (same sample as llm)", r.same_sample_checks))
+    for r in runs:
+        if fpr_lines := _negative_fpr(r.preds):
+            print(f"\n[{r.mode}] false-positive rate per not-scam label\n" + "\n".join(fpr_lines))
 
 
 async def _build_checks(
@@ -542,7 +717,7 @@ def main() -> None:
     parser.add_argument(
         "--dataset",
         default="examples",
-        help="examples | uci | mendeley | test | val | path to a CSV",
+        help="examples | uci | mendeley | test | val | india | collected | path to a CSV",
     )
     parser.add_argument("--name", help="report name (default: the dataset name)")
     parser.add_argument("--modes", default="rules,checks", help=f"comma-separated: {MODES}")
@@ -565,7 +740,11 @@ def main() -> None:
         help="seconds between LLM analyses (free tier: ~8k tokens/min)",
     )
     parser.add_argument("--limit", type=int, help="only the first N messages (quick runs)")
-    parser.add_argument("--out", help="write the report here instead of ml/reports/")
+    parser.add_argument(
+        "--out",
+        help="write the report here instead of ml/reports/ (a "
+        "gitignored path for sets with your collected messages)",
+    )
     args = parser.parse_args()  # fmt: skip
     asyncio.run(run(args))
 

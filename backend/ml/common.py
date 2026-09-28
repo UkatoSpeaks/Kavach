@@ -18,17 +18,44 @@ COLLECTED_DIR = DATASETS_DIR / "collected"  # your real messages, NOT anonymized
 SYNTHETIC_DIR = DATASETS_DIR / "synthetic"  # Groq generations (anonymized parents only)
 PROCESSED_DIR = DATASETS_DIR / "processed"  # anonymized, unified CSVs only
 REPORTS_DIR = BACKEND_DIR / "ml" / "reports"
+# Real messages to label by hand, written by ml/prepare_dataset.py (gitignored).
+REVIEW_QUEUE = DATASETS_DIR / "review_queue.csv"
+# Your applied review labels, written by ml/apply_review.py (gitignored).
+REVIEWED_LABELS = DATASETS_DIR / "reviewed_labels.csv"
+# Low-confidence AI-assisted labels, written by ml/apply_review.py for you to check
+# (gitignored). Your edits there are applied as "manual" on the next ml/apply_review.py run.
+LOW_CONFIDENCE = DATASETS_DIR / "review_low_confidence.csv"
+# label_source: empty or "manual" = you; "assisted" = labelled by an AI assistant (Claude)
+# reading the row, not by you. label_reason / confidence: the labeller's note (optional).
+REVIEW_COLUMNS = ("id", "text", "auto_label", "auto_scam_type", "top_signals", "my_label",
+                  "my_scam_type", "label_reason", "confidence", "label_source")  # fmt: skip
+REVIEWED_COLUMNS = ("id", "label", "scam_type", "auto_label", "auto_scam_type", "reviewed_on",
+                    "label_source", "label_reason", "confidence")  # fmt: skip
 
-LABELS = ("scam", "genuine")
-# Public datasets keep their own labels: their "spam" mixes promotions with scams, so it
-# is not our "scam" (see data/datasets/README.md).
+# promo_spam: legitimate or grey-area promotions (brand sales, betting/gaming ads) that are
+# not fraud. NOT a scam in any metric (like genuine), but kept apart so the promo
+# false-positive rate can be reported on its own.
+LABELS = ("scam", "genuine", "promo_spam")
+NOT_SCAM_LABELS = ("genuine", "promo_spam")
+# Public out-of-domain datasets keep their own labels: their "spam" mixes promotions with
+# scams, so it is not our "scam" (see data/datasets/README.md).
 OOD_LABELS = ("spam", "smishing")
 V1_SCAM_TYPES = tuple(t.value for t in ScamType)
+# A scam outside the v1 types (fake loan approval, investment tip ...).
+OTHER_SCAM_TYPE = "other"
+SCAM_TYPES = (*V1_SCAM_TYPES, OTHER_SCAM_TYPE)
+
+# Who decided the label: "manual" (you: collected or reviewed), "assisted" (reviewed by an
+# AI assistant, Claude, reading each row; not you), "dataset" (the source's own label, e.g.
+# ham), "auto" (pre-classified by ml/autolabel.py, unreviewed), "synthetic".
+LABEL_SOURCES = ("manual", "assisted", "dataset", "auto", "synthetic")
+# Labels a person or an assistant decided per message: these may enter the test split.
+REVIEWED_SOURCES = ("manual", "assisted")
 
 # The unified schema of every processed CSV.
 COLUMNS = (
     "id", "text", "label", "original_label", "scam_type", "language", "source", "dataset",
-    "is_synthetic", "is_indian", "parent_id", "split",
+    "is_synthetic", "is_indian", "label_source", "parent_id", "split",
 )  # fmt: skip
 
 _DEVA_RE = re.compile(r"[ऀ-ॿ]")
@@ -94,6 +121,29 @@ def guess_language(text: str) -> str:
     if strong >= 2 or (strong >= 1 and weak >= 2):
         return "hinglish"
     return "en"
+
+
+def label_problem(label: str, scam_type: str) -> str | None:
+    """Why a (label, scam_type) pair is invalid, or None. Both already lower-cased."""
+    if label not in LABELS:
+        return f"label must be {'|'.join(LABELS)}, got {label!r}"
+    if label == "scam" and scam_type and scam_type not in SCAM_TYPES:
+        return f"unknown scam_type {scam_type!r} (use one of: {', '.join(SCAM_TYPES)})"
+    if label != "scam" and scam_type:
+        return f"a {label} message has no scam_type"
+    return None
+
+
+def load_reviewed(path: Path | None = None) -> dict[str, dict[str, str]]:
+    """Applied review labels by message id (empty if none yet). Rows from before
+    label_source existed are yours ("manual")."""
+    path = path or REVIEWED_LABELS
+    if not path.exists():
+        return {}
+    rows = read_csv(path)
+    for r in rows:
+        r["label_source"] = (r.get("label_source") or "").strip() or "manual"
+    return {r["id"]: r for r in rows}
 
 
 def as_bool(value: Any) -> bool:

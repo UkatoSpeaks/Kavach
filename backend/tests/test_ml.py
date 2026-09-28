@@ -9,11 +9,24 @@ import pytest
 
 from app.core.enums import Verdict
 from app.schemas.analysis import AnalysisResult
-from app.services.extractors import extract_phones, extract_upi_ids, extract_urls
-from ml import generate_synthetic, prepare_dataset
+from app.services.extractors import (
+    extract_entities,
+    extract_phones,
+    extract_upi_ids,
+    extract_urls,
+)
+from ml import apply_review, autolabel, generate_synthetic, prepare_dataset
 from ml.anonymize import anonymize_text
-from ml.common import COLUMNS, guess_language, text_id
-from ml.evaluate import Item, Metrics, Prediction, balanced_sample, is_flagged
+from ml.common import (
+    COLUMNS,
+    REVIEW_COLUMNS,
+    guess_language,
+    load_reviewed,
+    read_csv,
+    text_id,
+    write_csv,
+)
+from ml.evaluate import Item, Metrics, Prediction, balanced_sample, is_flagged, load_csv_set
 from ml.prepare_dataset import dedupe, make_splits, stratified_pick, validate_collected
 
 # ----------------------------------------------------------------------------- anonymize
@@ -48,6 +61,29 @@ def test_names_after_greetings_are_replaced_everywhere_but_generic_greetings_sta
     for text in ("Dear Customer, KYC due", "Hi there, how are you", "hello how are you"):
         assert anonymize_text(text).text == text
     assert "राहुल" not in anonymize_text("प्रिय राहुल, आपका खाता बंद होगा").text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Dear PLAYER, double points on your next game",
+        "Hey Champ! Your team line-up is open",
+        "Hi User, your wallet is ready",
+        "Dear Member, Hello Friend, Dear Sir, Dear Madam",
+        "Congrats, Y0UR Received Rs.592000",
+        "Congratulations, Amount of Rs.44,000 is credited",
+        "Sorry, I sent it by mistake",
+        "Myntra, your order is on its way",
+    ],
+)
+def test_generic_salutations_and_openers_are_kept(text: str) -> None:
+    assert anonymize_text(text).text == text
+
+
+def test_name_opening_the_message_is_replaced() -> None:
+    r = anonymize_text("Riya, your saved shoes are back in stock. Riya, hurry!")
+    assert "Riya" not in r.text
+    assert r.text.startswith("Amit, your saved") and "Amit, hurry" in r.text
 
 
 def test_account_and_card_numbers_are_masked_consistently() -> None:
@@ -149,6 +185,7 @@ def _row(text: str, label: str = "scam", scam_type: str = "phishing_link", **kw:
         "text": text,
         "label": label,
         "scam_type": scam_type if label == "scam" else "",
+        "label_source": "manual",
     }
     return row | kw  # fmt: skip
 
@@ -161,12 +198,26 @@ def test_dedupe_exact_near_and_conflicting_labels() -> None:
         _row(base.replace("today", "tonight")),  # near duplicate
         _row("Hi, lunch at 1?", "genuine"),
         _row("OK", "genuine"),
-        _row("ok", "scam"),  # same text, other label: both dropped
+        _row("ok", "scam"),  # same text, other label, same authority: both dropped
         _row("Pay the e-challan of Rs 500 at http://echallan.top within 24 hours"),
     ]
     kept, report = dedupe(rows)
     assert [r["text"] for r in kept] == [base, "Hi, lunch at 1?", rows[-1]["text"]]
     assert (report.exact, report.near, report.conflicts) == (1, 1, 2)
+
+
+def test_dedupe_prefers_your_label_over_auto_and_dataset_labels() -> None:
+    text = "Flat 50% off on shoes, shop now at myntra"
+    auto = _row(text, "scam", label_source="auto")
+    mine = _row(text.upper(), "promo_spam", label_source="manual")
+    kept, report = dedupe([auto, mine])
+    assert [(r["label"], r["label_source"]) for r in kept] == [("promo_spam", "manual")]
+    assert report.conflicts == 1
+
+    # A near-duplicate with the same label keeps the more authoritative copy.
+    near = _row(text + " today", "promo_spam", label_source="auto")
+    kept, _ = dedupe([near, _row(text, "promo_spam", label_source="manual")])
+    assert [r["label_source"] for r in kept] == ["manual"]
 
 
 # ----------------------------------------------------------------------------- splits
@@ -239,6 +290,43 @@ def test_synthetic_rows_only_join_train_and_never_leak_held_out_messages() -> No
     assert all(r["split"] == "test" for r in out.test)
 
 
+def test_auto_and_dataset_labels_never_enter_the_test_split() -> None:
+    mine = _pool(10)
+    others = [_row(f"auto promo message {i}", "promo_spam", label_source="auto")
+              for i in range(40)]  # fmt: skip
+    others += [_row(f"dataset ham message {i}", "genuine", label_source="dataset")
+               for i in range(40)]  # fmt: skip
+    splits, manifest = make_splits(mine + others, [], rebuild_test=False, test_frac=0.2,
+                                   val_frac=0.15, manifest=None, today="d")  # fmt: skip
+    assert manifest is not None and splits.test
+    assert all(r["label_source"] == "manual" for r in splits.test)
+    other_ids = {r["id"] for r in others}
+    assert other_ids <= {r["id"] for r in splits.train + splits.val}
+    assert any(r["id"] in other_ids for r in splits.val)  # val may hold them
+
+    # 80 auto/dataset rows do not count towards the 30 needed for a test split.
+    few, none = make_splits(_pool(5) + others, [], rebuild_test=False, test_frac=0.2,
+                            val_frac=0.15, manifest=None, today="d")  # fmt: skip
+    assert none is None and few.test == []
+
+
+def test_review_queue_has_every_uncertain_row_and_a_fixed_sample_of_the_rest() -> None:
+    def auto(text: str, label: str) -> dict:
+        return _row(text, label, label_source="auto", auto_label=label, auto_scam_type="",
+                    top_signals="x")  # fmt: skip
+
+    rows = [auto(f"uncertain {i}", "uncertain") for i in range(5)]
+    rows += [auto(f"promo {i}", "promo_spam") for i in range(1000)]
+    rows += [_row("reviewed promo", "promo_spam", label_source="manual")]
+    queue = prepare_dataset.review_queue(rows)
+    labels = [q["auto_label"] for q in queue]
+    assert labels.count("uncertain") == 5
+    assert 60 <= labels.count("promo_spam") <= 140  # ~10%
+    assert "reviewed promo" not in {q["text"] for q in queue}
+    assert all(q["my_label"] == "" for q in queue)
+    assert prepare_dataset.review_queue(rows) == queue  # same sample every run
+
+
 def test_stratified_pick_skips_tiny_groups() -> None:
     rows = [_row("one qr scam", "scam", "qr_code"), _row("two qr scam", "scam", "qr_code")]
     assert stratified_pick(rows, 0.5, "s") == set()
@@ -249,6 +337,10 @@ def test_collected_rows_are_validated() -> None:
     assert validate_collected({"text": "x", "label": "spam"})
     assert validate_collected({"text": "x", "label": "scam", "scam_type": "loan_app"})
     assert validate_collected({"text": "x", "label": "genuine", "scam_type": "qr_code"})
+    assert validate_collected({"text": "x", "label": "promo_spam"}) is None
+    assert validate_collected({"text": "x", "label": "Promo_Spam", "scam_type": ""}) is None
+    assert validate_collected({"text": "x", "label": "promo_spam", "scam_type": "qr_code"})
+    assert validate_collected({"text": "x", "label": "scam", "scam_type": "other"}) is None
 
 
 def test_collected_messages_are_anonymized_on_load(tmp_path: Path) -> None:
@@ -262,6 +354,123 @@ def test_collected_messages_are_anonymized_on_load(tmp_path: Path) -> None:
     assert len(rows) == 1 and len(problems) == 1
     assert "Rahul" not in rows[0]["text"] and "9876543210" not in rows[0]["text"]
     assert "₹3,000" in rows[0]["text"] and rows[0]["is_indian"] is True
+
+
+# ----------------------------------------------------------------------------- India spam
+
+
+@pytest.mark.parametrize(
+    ("text", "label", "scam_type"),
+    [
+        ("Neha, get Min. 60% Off on top kids brands. Ajio's Big Bold Sale ends tomorrow "
+         "shrt.in/Qw8LpZ", "promo_spam", ""),
+        ("Unlimited calls + 2GB/day at Rs 299. Recharge now on the Airtel Thanks app. T&C "
+         "apply", "promo_spam", ""),
+        ("Your SBI account will be blocked today. Update KYC at http://sbi-kyc.xyz/login and "
+         "share the OTP", "scam", "phishing_link"),
+        ("Congrats, Rs.64,300/- added to y0ur Wallet today. Withdraw directly: "
+         "http://k7q2.com/wz3pvb!51m0qx", "scam", "phishing_link"),
+        ("Hi, your payout of Rs.58,120 is credited to the Game Wallet 0N 09 SEP. "
+         "Withdraw N0W: http://3tz8.com/qpl0vx!7c2d9k", "scam", "phishing_link"),
+        ("Hello, please call me when you are free", "uncertain", ""),
+    ],
+)  # fmt: skip
+def test_auto_label(text: str, label: str, scam_type: str) -> None:
+    got = autolabel.auto_label(text)
+    assert (got.label, got.scam_type) == (label, scam_type), got.signals
+    assert got.top_signals
+
+
+def test_leetspeak_and_random_domains() -> None:
+    assert autolabel.leetspeak("Withdraw N0W") == "N0W"
+    assert autolabel.leetspeak("Credited to yOur A/c") == "yOur"
+    for text in ("Pay Rs 100 at 10 AM", "Get it on WhatsApp or iPhone", "Call 0120 400 0000",
+                 "Valid for 24 daysAlso get", "at 10:00AM"):  # fmt: skip
+        assert autolabel.leetspeak(text) is None, text
+    assert autolabel.random_domain(extract_entities("go to 9lp7.com/x")) == "9lp7.com"
+    assert autolabel.random_domain(extract_entities("go to smsd.in/x or m2.com")) is None
+
+
+def test_india_rows_ham_is_genuine_spam_is_auto_labelled_and_reviews_win(
+    tmp_path: Path,
+) -> None:
+    raw = tmp_path / "india.csv"
+    ham = "Hey, reached home. Call you at 9876543210 later"
+    promo = "Flat 60% off on all shoes. Sale ends Sunday. Shop now on Myntra"
+    reviewed = "Big Diwali sale, 40% off on TVs at Croma. T&C apply"
+    raw.write_text(
+        f'Msg,Label\n"{ham}",ham\n"{promo}",spam\n"{reviewed}",spam\n,spam\n', encoding="utf-8"
+    )
+    mine = {text_id(reviewed): {"label": "scam", "scam_type": "other"}}
+    rows = prepare_dataset.load_india_spam(raw, reviewed=mine)
+    assert [(r["label"], r["label_source"]) for r in rows] == [
+        ("genuine", "dataset"), ("promo_spam", "auto"), ("scam", "manual"),
+    ]  # fmt: skip
+    assert all(r["is_indian"] and not r["is_synthetic"] for r in rows)
+    assert {r["source"] for r in rows} == {"india_spam_sms"}
+    assert [r["original_label"] for r in rows] == ["ham", "spam", "spam"]
+    assert "9876543210" not in rows[0]["text"] and rows[0]["id"] == text_id(ham)
+    assert rows[1]["auto_label"] == "promo_spam" and rows[1]["top_signals"]
+
+
+def test_download_skips_a_file_with_the_right_checksum(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from ml import download_public
+
+    path = tmp_path / "spam_ham_india.csv"
+    path.write_bytes(b"Msg,Label\nhi,ham\n")
+    monkeypatch.setattr(download_public, "INDIA_SPAM_FILE", path)
+    monkeypatch.setattr(download_public, "INDIA_SPAM_SHA256",
+                        download_public.sha256_of(path.read_bytes()))  # fmt: skip
+
+    def no_network(*a: object, **k: object) -> None:
+        raise AssertionError("must not download")
+
+    monkeypatch.setattr(download_public.httpx, "get", no_network)
+    download_public.download_india_spam(force=False)
+    assert "checksum OK" in capsys.readouterr().out
+
+
+# ----------------------------------------------------------------------------- review
+
+
+def test_apply_review_merges_labels_and_reports_accuracy(tmp_path: Path) -> None:
+    queue, store = tmp_path / "queue.csv", tmp_path / "reviewed.csv"
+    rows = [
+        {"id": "a", "text": "t", "auto_label": "scam", "auto_scam_type": "phishing_link",
+         "top_signals": "", "my_label": "scam", "my_scam_type": ""},
+        {"id": "b", "text": "t", "auto_label": "scam", "auto_scam_type": "phishing_link",
+         "top_signals": "", "my_label": "promo", "my_scam_type": ""},
+        {"id": "c", "text": "t", "auto_label": "promo_spam", "auto_scam_type": "",
+         "top_signals": "", "my_label": "promo_spam", "my_scam_type": ""},
+        {"id": "d", "text": "t", "auto_label": "uncertain", "auto_scam_type": "",
+         "top_signals": "", "my_label": "scam", "my_scam_type": ""},
+        {"id": "e", "text": "t", "auto_label": "uncertain", "auto_scam_type": "",
+         "top_signals": "", "my_label": "", "my_scam_type": ""},
+        {"id": "f", "text": "t", "auto_label": "uncertain", "auto_scam_type": "",
+         "top_signals": "", "my_label": "maybe", "my_scam_type": ""},
+    ]  # fmt: skip
+    write_csv(queue, rows, REVIEW_COLUMNS)
+    reviewed, new, problems = apply_review.apply(queue, store)
+    assert new == 4 and len(problems) == 1 and "maybe" in problems[0]
+    assert reviewed["a"]["scam_type"] == "phishing_link"  # empty: the auto type
+    assert reviewed["b"]["label"] == "promo_spam"  # alias
+    assert reviewed["d"]["scam_type"] == "other"
+    assert load_reviewed(store) == reviewed
+
+    report = "\n".join(apply_review.accuracy_report(list(reviewed.values())))
+    assert "| scam | 2 | 1 | 50.0% | 1/1 |" in report
+    assert "| promo_spam | 1 | 1 | 100.0% | – |" in report
+    assert "| uncertain | 1 | 0 | 0 |" in report  # scam, genuine, promo_spam columns
+
+
+def test_prepare_does_not_overwrite_a_filled_queue(tmp_path: Path) -> None:
+    queue = tmp_path / "q.csv"
+    write_csv(queue, [{"id": "x", "my_label": "scam"}, {"id": "y", "my_label": ""}],
+              REVIEW_COLUMNS)  # fmt: skip
+    assert prepare_dataset.unapplied_reviews(queue, {}) == 1
+    assert prepare_dataset.unapplied_reviews(queue, {"x": {}}) == 0
 
 
 # ----------------------------------------------------------------------------- synthetic
@@ -302,8 +511,121 @@ def test_metrics_treat_suspicious_and_scam_as_flagged() -> None:
     assert m.fpr == pytest.approx(1 / 3) and m.f1 == pytest.approx(2 / 3)
 
 
+def test_promo_spam_is_a_negative_with_its_own_group_and_uncertain_is_left_out(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "set.csv"
+    write_csv(path, [
+        {"id": "1", "text": "a", "label": "scam", "scam_type": "phishing_link"},
+        {"id": "2", "text": "b", "label": "promo_spam", "label_source": "auto"},
+        {"id": "3", "text": "c", "label": "genuine", "label_source": "dataset"},
+        {"id": "4", "text": "d", "label": "uncertain", "label_source": "auto"},
+    ], COLUMNS)  # fmt: skip
+    items = load_csv_set(path, "x", "").items
+    assert [(it.positive, it.group, it.label_source) for it in items] == [
+        (True, "phishing_link", ""), (False, "promo_spam", "auto"), (False, "genuine", "dataset"),
+    ]  # fmt: skip
+
+
 def test_balanced_sample_is_fixed_and_balanced() -> None:
     items = [Item(str(i), "t", i < 10, "g", "en") for i in range(100)]
     sample = balanced_sample(items, 8)
     assert sum(it.positive for it in sample) == 4 and len(sample) == 8
     assert balanced_sample(items, 8) == sample
+
+
+def test_reports_quoting_collected_messages_stay_out_of_git(tmp_path: Path) -> None:
+    from ml import evaluate
+
+    path = tmp_path / "set.csv"
+    rows = [{"id": "1", "text": "a", "label": "genuine", "dataset": "india_spam_sms"}]
+    write_csv(path, rows, COLUMNS)
+    public = load_csv_set(path, "x", "")
+    assert not public.private
+    assert evaluate.report_path(public, "x", None).parent == evaluate.REPORTS_DIR
+
+    write_csv(path, [*rows, {"id": "2", "text": "b", "label": "scam", "dataset": "collected"}],
+              COLUMNS)  # fmt: skip
+    mine = load_csv_set(path, "x", "")
+    assert mine.private
+    assert evaluate.report_path(mine, "x", None).parent == evaluate.PRIVATE_REPORTS_DIR
+    assert evaluate.report_path(mine, "x", str(tmp_path / "r.md")) == tmp_path / "r.md"
+    with pytest.raises(SystemExit):  # a path git would track
+        evaluate.report_path(mine, "x", str(evaluate.REPORTS_DIR / "2026-01-01_x.md"))
+
+
+def _queue_row(row_id: str, label: str, **extra: str) -> dict[str, str]:
+    return {"id": row_id, "text": f"text {row_id}", "auto_label": "uncertain",
+            "auto_scam_type": "", "top_signals": "", "my_label": label, "my_scam_type": "",
+            **extra}  # fmt: skip
+
+
+def test_assisted_labels_are_kept_apart_and_never_replace_yours(tmp_path: Path) -> None:
+    queue, store = tmp_path / "queue.csv", tmp_path / "reviewed.csv"
+    write_csv(queue, [_queue_row("a", "genuine")], REVIEW_COLUMNS)  # yours (no source)
+    apply_review.apply(queue, store)
+    write_csv(queue, [
+        _queue_row("a", "promo_spam", label_source="assisted"),
+        _queue_row("b", "scam", label_source="assisted", label_reason="fake prize",
+                   confidence="high"),
+        _queue_row("c", "promo", label_source="robot"),
+    ], REVIEW_COLUMNS)  # fmt: skip
+    reviewed, new, problems = apply_review.apply(queue, store)
+    assert new == 1 and len(problems) == 1 and "robot" in problems[0]
+    assert (reviewed["a"]["label"], reviewed["a"]["label_source"]) == ("genuine", "manual")
+    assert reviewed["b"]["label_source"] == "assisted"
+    assert reviewed["b"]["label_reason"] == "fake prize"
+    assert load_reviewed(store) == reviewed
+
+
+def test_low_confidence_edits_become_manual(tmp_path: Path) -> None:
+    queue, store, low = tmp_path / "q.csv", tmp_path / "r.csv", tmp_path / "low.csv"
+    write_csv(queue, [
+        _queue_row(i, "promo_spam", label_source="assisted", confidence=c)
+        for i, c in (("x", "low"), ("y", "low"), ("z", "low"), ("h", "high"))
+    ], REVIEW_COLUMNS)  # fmt: skip
+    reviewed, _, _ = apply_review.apply(queue, store)
+    written = apply_review.write_low_confidence(low, queue, reviewed)
+    assert [r["id"] for r in written] == ["x", "y", "z"]
+
+    rows = {r["id"]: r for r in read_csv(low)}
+    rows["x"]["my_label"] = "scam"  # you changed the label
+    rows["y"]["label_source"] = "manual"  # you confirmed it as is
+    write_csv(low, rows.values(), REVIEW_COLUMNS)
+    changed, problems = apply_review.apply_low_confidence(low, store)
+    assert (changed, problems) == (2, [])
+    reviewed, _, _ = apply_review.apply(queue, store)  # re-applying the queue changes nothing
+    assert (reviewed["x"]["label"], reviewed["x"]["label_source"]) == ("scam", "manual")
+    assert reviewed["x"]["scam_type"] == "other"
+    assert (reviewed["y"]["label"], reviewed["y"]["label_source"]) == ("promo_spam", "manual")
+    assert reviewed["z"]["label_source"] == "assisted"
+    after = {r["id"]: r for r in apply_review.write_low_confidence(low, queue, reviewed)}
+    assert after["x"]["my_label"] == "scam" and after["z"]["label_source"] == "assisted"
+
+
+def test_assisted_rows_may_enter_test_and_are_counted_apart() -> None:
+    rows = [{"label_source": s} for s in ("manual", "assisted", "assisted", "dataset")]
+    assert [prepare_dataset.test_eligible(r) for r in rows] == [True, True, True, False]
+    assert prepare_dataset.label_note(rows[:3]) == "1 manual (author), 2 AI-assisted (Claude)"
+
+
+def test_reports_state_label_sources_and_split_metrics() -> None:
+    from ml import evaluate
+
+    items = [Item("1", "t", True, "g", "en", label="scam", label_source="manual"),
+             Item("2", "t", False, "g", "en", label="genuine", label_source="assisted"),
+             Item("3", "t", True, "g", "en", label="scam", label_source="assisted")]  # fmt: skip
+    es = evaluate.EvalSet("test", items, "", "")
+    assert evaluate.label_note(es, "test") == (
+        "Test labels: 1 manual (author), 2 AI-assisted (Claude)"
+    )
+    preds = [Prediction(it, AnalysisResult(risk_score=80, verdict=Verdict.SCAM), 1.0)
+             for it in items]  # fmt: skip
+    groups = evaluate.by_label_source("checks", preds)
+    assert [(label, len(g)) for label, g in groups] == [
+        ("checks · combined", 3), ("checks · manual labels", 1),
+        ("checks · AI-assisted labels", 2),
+    ]  # fmt: skip
+    only_dataset = evaluate.EvalSet("india", [Item("4", "t", False, "g", "en",
+                                                   label_source="dataset")], "", "")  # fmt: skip
+    assert evaluate.label_note(only_dataset, "india") is None

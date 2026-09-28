@@ -78,3 +78,14 @@ class ExtractedEntities(BaseModel):
     remote_access_apps: list[str] = Field(default_factory=list)
     apk_links: list[str] = Field(default_factory=list, description="URLs pointing at an .apk.")
     apk_files: list[str] = Field(default_factory=list, description="Any *.apk file names seen.")
+    # For the rules only, never stored (exclude=True): see app/services/normalize.py.
+    rule_texts: list[str] = Field(
+        default_factory=list,
+        exclude=True,
+        description="normalized_text with leet folded back into letters (1->i, then 1->l).",
+    )
+    evasions: list[str] = Field(
+        default_factory=list,
+        exclude=True,
+        description="Leet or oddly capitalized words, as written ('N0W', 'yOur').",
+    )

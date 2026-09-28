@@ -8,9 +8,10 @@ What is replaced
 - Indian mobile numbers (all of them: a personal number and a scammer's look the same, and
   the detectors only care about the format) -> 99999xxxxx, keeping the original prefix and
   separators: "+91 98765 43210" -> "+91 99999 10234".
-- The name after a greeting ("Dear Rahul", "Hi Priya Sharma", "प्रिय राहुल") -> a placeholder
-  name, everywhere it appears in the message. Generic greetings ("Dear Customer", "Hi
-  Sir") are left alone.
+- The name after a greeting ("Dear Rahul", "Hi Priya Sharma", "प्रिय राहुल"), or a name that
+  opens the message followed by a comma ("Riya, your order ...") -> a placeholder name,
+  everywhere it appears in the message. Generic salutations ("Dear Customer", "Dear PLAYER",
+  "Hey Champ", "Congrats, ...") are left alone.
 - Names in bank/UPI alerts: "received from RAHUL KUMAR", "paid to Priya", "credited by ...",
   "Name: ..." and, in a message that looks like a transaction alert, a bare "from/to/by
   <Name>". Brands and merchants ("paid to Swiggy", "from Meghana Foods") are kept.
@@ -54,16 +55,28 @@ PERSONAL_MAIL = frozenset({
     "live.com", "icloud.com", "protonmail.com", "ymail.com",
 })  # fmt: skip
 
-# Words after a greeting that are not names.
+# Words after a greeting that are not names (generic salutations).
 NOT_NAMES = frozenset(
     """
     customer customers sir sirji madam maam ma'am mam user users member members consumer
+    player players gamer gamers champ champs champion champions winner winners buddy pal
     consumers cardholder card holder valued esteemed team all everyone friend friends there
     guys dear sir/madam client subscriber applicant candidate beneficiary investor patron
     shopper traveller passenger holder account policyholder grahak upbhokta ji bhai bhaiya
     didi uncle aunty sister brother mom mummy maa papa dad beta
     """.split()
 ) | {"ग्राहक", "उपभोक्ता", "सदस्य", "महोदय", "महोदया", "मित्र", "जी", "भाई", "साथी", "ग्राहकों"}
+
+# First words of a message that are followed by a comma but are not names ("Congrats, ...").
+NOT_OPENING_NAMES = NOT_NAMES | frozenset(
+    """
+    congrats congratulations hello hi hey hii dear namaste namaskar greetings welcome sorry
+    oops yes yeah no ok okay alert attention reminder hurry urgent important note notice
+    update thanks thank please kindly wow great well so also now today tonight tomorrow
+    again finally guys folks bro dude listen look wait hmm hurray yay psst good bad happy
+    hurrah whoa
+    """.split()
+)
 
 # Capitalized words after from/to/by in alerts that are not people.
 NOT_ALERT_NAMES = NOT_NAMES | frozenset(
@@ -131,6 +144,8 @@ _GREETING_RE = re.compile(
     r"(?P<name>[A-Z][a-z]{1,20}(?:\s[A-Z][a-z]{1,20})?|[A-Z]{2,20}(?:\s[A-Z]{2,20})?)\b"
     r"|(?P<greet_hi>(?:प्रिय|नमस्ते|नमस्कार)[\s,]+)(?P<name_hi>[ऀ-ॿ]+)"
 )
+# A capitalized name opening the message, then a comma: "Riya, your order is ...".
+_OPENING_NAME_RE = re.compile(r"^\s*(?P<name>[A-Z][a-z]{1,20}),\s")
 # Full account/card numbers after a keyword, and masked tails (XX1234, XXXX-XXXX-1234, **1234).
 _ACCOUNT_RE = re.compile(
     r"(?P<kw>\b(?:a/c|acct|account|card|khata|खाता)(?:\s*(?:no|number|num|ending(?:\s+with)?))?"
@@ -259,6 +274,10 @@ class _Anonymizer:
                     continue
                 name = " ".join(words)
             found.append((name, hindi))
+        if m := _OPENING_NAME_RE.match(self.text):
+            name = m.group("name")
+            if name.lower() not in NOT_OPENING_NAMES | BRANDS:
+                found.append((name, False))
         found += [(name, False) for name in self._alert_names()]
         for name, hindi in found:
             pool = FAKE_NAMES_HI if hindi else FAKE_NAMES

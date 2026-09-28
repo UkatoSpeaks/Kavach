@@ -2,12 +2,19 @@ import pytest
 
 from app.core.enums import ScamType
 from app.services.extractors import extract_entities
-from app.services.rules import RULES, RULES_BY_ID, evaluate, saturating_score
+from app.services.rules import (
+    RULES,
+    RULES_BY_ID,
+    evaluate,
+    largest_amount,
+    saturating_score,
+)
 
 
 def fires(rule_id: str, text: str) -> str | None:
-    entities = extract_entities(text)
-    return RULES_BY_ID[rule_id].check(entities.normalized_text, entities)
+    """The rule's evidence, through evaluate (leet folded, evidence as written), or None."""
+    hits = evaluate(extract_entities(text), [RULES_BY_ID[rule_id]]).hits
+    return hits[0].evidence if hits else None
 
 
 # rule id -> (message that must trigger it, similar message that must not)
@@ -55,6 +62,24 @@ CASES: dict[str, tuple[str, str]] = {
     "short_url": (
         "Check details at https://bit.ly/3AbCd",
         "Check details at https://www.sbi.co.in/web/personal-banking",
+    ),
+    "fake_credit_alert": (
+        "Dear 90196xxxxx, Rs.38,OOO/- is Added t0 your wallet account. Directly Withdraw N0w "
+        "k2v8.in/2vclen",
+        "Rs.250 credited as FREE Cash Points in your account to shop at our store. TnC: "
+        "bit.ly/3vdC7ss",
+    ),
+    "tracking_suffix_link": (
+        "Withdraw now: http://x7q2.com/pq0rs1!3kd9w4",
+        "Your order is on the way: http://fkrt.it/!tZdi1NNNNN",
+    ),
+    "throwaway_domain": (
+        "Withdraw now: http://9lp7.com/abc",
+        "Order medicines at 1mg.com/offers",
+    ),
+    "filter_evasion": (
+        "Y0ur B0nus is ready, claim N0W",
+        "Store open 11:00AM-9:30PM. 5G plans, B1G1 offers, 4GB/day. 2 daysAlso on iPhone",
     ),
     "lookalike_domain": (
         "Login at https://hdfcbank-secure-login.com/verify",
@@ -337,3 +362,141 @@ def test_rule_weights_and_descriptions() -> None:
     for rule in RULES:
         assert 0 < rule.weight <= 1, rule.id
         assert rule.description_en and rule.description_hi, rule.id
+
+
+# ----------------------------------------------------------------------------- link rules
+# Shapes from the India Spam SMS scams (public dataset); domains and codes changed.
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Hi 90196xxxxx, Rs.56,6OO/- Bonus is credited t0 your wallet N0 XX32 0n 28 Aug. Directly "
+        "move to your Bank A/c N0w k2v8.in/2uabg2!8cpr814",
+        "Y0u have receive a B0nus of Rs.51OOO/- in Y0ur wallet. M0ve to Y0ur Bank A/c "
+        "k2v8.in/2rn2ds",
+        "Dear User, payout successfully credited: Rs.64,250 in the Game Wallet 0n 3 Sep. "
+        "Withdraw N0W: http://x7q2.com/ab12cd",
+        "Congrats User, Rs.15OOO Bonus is Credited to your wallet. Direct y0ur ac - "
+        "https://q3z.in/O13D-2i19",
+        "Dear Customer, Rs. 10,000* Welcome Cash is credited to your acc. XXX892 Download & "
+        "Claim Now: http://p6x.in/srBaqC",
+    ],
+)
+def test_fake_credit_alert_variants(text: str) -> None:
+    assert fires("fake_credit_alert", text) is not None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # promos: small amounts, a deposit first, "ready to be credited"
+        "Congratulations!Rs40 CASHBACK coupon credited to your Vi App bit.ly/ViRchg9 .Login "
+        "to claim. Available on packs of Rs399+",
+        "Rs.20000 Bonus gets Credited on your first deposit of Rs.4000. Claim now - "
+        "http://play.example.com/b",
+        "Your Rs.8850 welcome bonus is ready to be credited. Claim bonus: http://1kx.in/hO9g4Y",
+        # genuine alerts: a credit, but nothing to cash out
+        "Rs.25,000.00 credited to your A/c XX1234 on 12-09. Not you? Report at "
+        "https://www.hdfcbank.com/report",
+        "Your claim of Rs 25,000 has been settled and credited. Track claim status at "
+        "https://insurer.example.com/track",
+        "Rs.5000 withdrawn from A/c XX1234 at ATM. Received Rs 2,000 from Rahul. Details: "
+        "https://bank.example.com/x",
+        # withdraw to your bank, but on the official site
+        "Rs 12,000 received in your Paytm wallet. Withdraw to your bank at https://paytm.com/w",
+    ],
+)
+def test_fake_credit_alert_ignores_promos_and_genuine_alerts(text: str) -> None:
+    assert fires("fake_credit_alert", text) is None
+
+
+def test_fake_credit_amount_with_letter_o() -> None:
+    e = extract_entities("Rs.44,OOO/- is credited t0 your wallet. Withdraw N0w k2v8.in/x")
+    assert largest_amount(e.normalized_text, e) == 44000
+    e = extract_entities("Rs.500off on shoes")
+    assert largest_amount(e.normalized_text, e) == 500
+
+
+@pytest.mark.parametrize(
+    ("url", "flagged"),
+    [
+        ("OI1.in/2vclen!8cpr814", True),
+        ("SR3.in/abc!x9y8z7", True),
+        ("http://fkrt.it/!tZdi1NNNNN", False),  # Flipkart: "!" right after the slash
+        ("https://example.com/sale!Hurry", False),  # no digit in the code
+        ("https://example.com/a!b1", False),  # code too short
+    ],
+)
+def test_tracking_suffix_link(url: str, flagged: bool) -> None:
+    assert (fires("tracking_suffix_link", f"Open {url} now") is not None) is flagged
+
+
+@pytest.mark.parametrize(
+    ("url", "flagged"),
+    [
+        ("9lp7.com/x", True),
+        ("OI1.in/x", True),
+        ("http://p6x.in/srBaqC", True),
+        ("gmg.im/x", False),  # letters only
+        ("smsd.in/x", False),
+        ("1mg.com/x", False),  # a real pharmacy
+        ("bit.ly/3x", False),  # shorteners are short_url's business
+        ("abc123def.com/x", False),  # longer than 5
+    ],
+)
+def test_throwaway_domain(url: str, flagged: bool) -> None:
+    assert (fires("throwaway_domain", f"Open {url} now") is not None) is flagged
+
+
+def test_short_url_alone_stays_below_suspicious() -> None:
+    """A shortener with nothing else is capped (even a full pattern-similarity match on top
+    stays below 35); next to another rule it counts with its full weight."""
+    alone = evaluate(extract_entities("Watch the final on our app! bit.ly/4QxRt7z"))
+    assert [h.rule.id for h in alone.hits] == ["short_url"] and alone.supporting_only
+    assert alone.score == 20 and 0.857 * alone.score + 0.143 * 100 < 35
+    both = evaluate(extract_entities("Your account will be blocked. Update at bit.ly/4QxRt7z"))
+    assert both.score == saturating_score([0.45, 0.45]) and not both.supporting_only
+
+
+def test_supporting_signs_together_stay_capped() -> None:
+    result = evaluate(extract_entities("Y0ur l0gin page: 9lp7.com/x and bit.ly/3x"))
+    ids = {h.rule.id for h in result.hits}
+    assert ids == {"short_url", "throwaway_domain", "filter_evasion"} and result.score == 20
+
+
+def test_loan_link_is_caught_by_the_link_signs_together() -> None:
+    # No "loan approved" rule (out of v1 scope): the tracking code plus the throwaway domain.
+    result = evaluate(extract_entities(
+        "Dear User, your Rs 2,40,000 personal loan is sanctioned. Money in your bank in 10 "
+        "mins. Verify here x7q2.com/kd83jf!2mx0qa"
+    ))  # fmt: skip
+    assert {h.rule.id for h in result.hits} == {"tracking_suffix_link", "throwaway_domain"}
+    assert result.score >= 35
+
+
+def test_leet_evidence_is_reported_as_written() -> None:
+    hits = {h.rule.id: h.evidence for h in evaluate(extract_entities(
+        "Sh@re y0ur OTP now. Payout successfully credited: Rs.64,250. Withdraw N0W: "
+        "http://x7q2.com/ab12cd"
+    )).hits}  # fmt: skip
+    assert "sh@re y0ur otp" in hits["credential_request"]
+    assert hits["fake_credit_alert"] == "successfully credited … withdraw"
+    assert hits["filter_evasion"] == "Sh@re … y0ur … N0W"
+
+
+def test_one_is_read_as_i_and_as_l() -> None:
+    assert fires("pin_to_receive", "Enter your UPI p1n to rece1ve Rs 5,000") == (
+        "enter your upi p1n to rece1ve rs 5,000"
+    )
+    assert fires("account_blocked", "Your wa11et wi11 be b1ocked") is None  # "11": a code
+    assert fires("account_blocked", "Your acc0unt wi1l be b1ocked today") is not None
+
+
+def test_missing_space_after_a_plan_length_is_no_link_sign() -> None:
+    # "28D.Click" was read as the domain 28d.click: suspicious_tld + throwaway_domain.
+    result = evaluate(extract_entities(
+        "Watch the cricket LIVE! 1yr streaming pack @Rs399. Also 2GB/D & calls for 84D.Click "
+        "bit.ly/4QxRt7z"
+    ))  # fmt: skip
+    assert [h.rule.id for h in result.hits] == ["short_url"] and result.score == 20
