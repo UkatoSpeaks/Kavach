@@ -1,6 +1,7 @@
 """Abuse protection and production hardening: rate limits, client IP behind Render's proxy,
 body limits, the error format, security headers, CORS, docs, /health."""
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
@@ -8,15 +9,19 @@ from uuid import uuid4
 
 import httpx
 import pytest
+import respx
 from fastapi import FastAPI
 
 from app.api.protection import forwarded_client
 from app.api.routes import report
+from app.api.routes.health import CachedCheck
 from app.core.config import Settings, get_settings
 from app.core.enums import EntityType
 from app.db.models import ReportedEntity
 from app.main import create_app
+from app.services.agent.llm import GroqReasoner, PingResult
 from tests.conftest import ClientFactory, settings_for_tests
+from tests.fakes import scripted_groq
 
 TEXT = {"text": "Your electricity bill is due tomorrow, pay at the office."}
 
@@ -95,15 +100,127 @@ async def test_limit_is_per_forwarded_client(make_client: ClientFactory) -> None
         # fewer entries than hops: the leftmost was still written by a proxy
         ("10.1.2.3", ["1.1.1.1"], 2, "1.1.1.1"),
         ("10.1.2.3", ["1.1.1.1, 104.22.17.40"], 1, "104.22.17.40"),
+        # a proxy in the shared 100.64.0.0/10 range (neither private nor global) is trusted
+        ("100.64.12.7", ["1.1.1.1, 104.22.17.40"], 2, "1.1.1.1"),
+        ("fd00::12", ["1.1.1.1, 104.22.17.40"], 2, "1.1.1.1"),
+        # an internal proxy appending its own hop doesn't shift the pick onto the edge IP
+        ("10.1.2.3", ["6.6.6.6, 1.1.1.1, 104.22.17.40, 10.9.8.7"], 2, "1.1.1.1"),
+        ("10.1.2.3", ["1.1.1.1, 104.22.17.40, 100.64.0.9, 10.9.8.7"], 2, "1.1.1.1"),
+        ("10.1.2.3", ["2401:4900:1c2a::1, 104.22.17.40"], 2, "2401:4900:1c2a::1"),
         # a public peer is not our proxy: the header is ignored
         ("8.8.8.8", ["1.1.1.1, 104.22.17.40"], 2, None),
         ("10.1.2.3", ["1.1.1.1, 104.22.17.40"], 0, None),
         ("10.1.2.3", [], 2, None),
+        ("10.1.2.3", ["10.0.0.1, 10.0.0.2"], 2, None),  # nothing but internal hops
         ("10.1.2.3", ["not-an-ip, 104.22.17.40"], 2, None),
     ],
 )
 def test_forwarded_client(peer: str, header: list[str], hops: int, expected: str | None) -> None:
     assert forwarded_client(peer, header, hops) == expected
+
+
+# ----------------------------------------------------------------------------- /debug/client-ip
+
+
+async def test_debug_client_ip_is_off_by_default() -> None:
+    _, client = _app(TRUSTED_PROXY_HOPS=2)
+    async with client:
+        assert (await client.get("/debug/client-ip")).status_code == 404
+
+
+async def test_debug_client_ip_reports_resolution_without_header_values() -> None:
+    _, client = _app(DEBUG_IP_ENDPOINT=True, TRUSTED_PROXY_HOPS=2)
+    headers = {
+        "X-Forwarded-For": "6.6.6.6, 1.1.1.1, 104.22.17.40",
+        "CF-Connecting-IP": "1.1.1.1",
+    }
+    async with client:
+        body = (await client.get("/debug/client-ip", headers=headers)).json()
+    assert body["client_ip"] == "1.1.1.1"
+    assert body["resolved_from"] == "x-forwarded-for"
+    assert body["peer_kind"] == "loopback"  # the test transport's peer, 127.0.0.1
+    assert body["x_forwarded_for_hops"] == 3 and body["trusted_proxy_hops"] == 2
+    assert body["other_ip_headers_present"] == ["cf-connecting-ip"]
+    assert isinstance(body["pid"], int)
+    assert "6.6.6.6" not in str(body) and "104.22.17.40" not in str(body)
+
+
+# ----------------------------------------------------------------------------- /health/llm
+
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+PING_REPLY = {
+    "id": "x", "object": "chat.completion", "created": 0, "model": "m",
+    "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                 "finish_reason": "length"}],
+}  # fmt: skip
+
+
+def _groq(key: str = "gsk_testkey123") -> GroqReasoner:
+    return GroqReasoner(key, "big-model", "small-model", timeout_s=2)
+
+
+async def test_health_llm_disabled_without_a_key(make_client: ClientFactory) -> None:
+    async with make_client() as client:
+        body = (await client.get("/health/llm")).json()
+    assert body["status"] == "ok" and body["llm"] == "disabled"
+    assert body["config"]["key_set"] in (True, False)  # the local .env's; never the value
+
+
+@respx.mock
+async def test_health_llm_ok_and_cached(make_client: ClientFactory) -> None:
+    route = respx.post(GROQ_URL).mock(return_value=httpx.Response(200, json=PING_REPLY))
+    async with make_client(reasoner=_groq()) as client:
+        first = (await client.get("/health/llm")).json()
+        second = (await client.get("/health/llm")).json()
+    assert route.call_count == 1  # the second answer is the cached one
+    assert first["llm"] == "ok" and first["reachable"] and not first["cached"]
+    assert first["model"] == "big-model" and first["error_class"] is None
+    assert second["llm"] == "ok" and second["cached"]
+
+
+async def test_health_llm_reports_the_error_class_without_secrets(
+    make_client: ClientFactory,
+) -> None:
+    groq_client, _ = scripted_groq(
+        httpx.ConnectError("refused while sending Bearer gsk_testkey123"), api_key="gsk_testkey123"
+    )
+    llm = GroqReasoner("gsk_testkey123", "big-model", "small-model", client=groq_client)
+    async with make_client(reasoner=llm) as client:
+        resp = await client.get("/health/llm")
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["llm"] == "error" and body["reachable"] is False
+    assert body["error_class"] == "APIConnectionError"
+    assert body["error_causes"] == ["httpx.ConnectError"]
+    assert body["error_message"] == "refused while sending [redacted]"
+    assert "gsk_testkey123" not in resp.text
+    assert isinstance(body["elapsed_ms"], float)
+
+
+async def test_health_llm_is_rate_limited(make_client: ClientFactory) -> None:
+    async with make_client(RATE_LIMIT_ENABLED=True, RATE_LIMIT_HEALTH_LLM="1/minute") as client:
+        assert (await client.get("/health/llm")).status_code == 200
+        assert (await client.get("/health/llm")).status_code == 429
+
+
+async def test_cached_check_runs_once_for_concurrent_callers() -> None:
+    calls = 0
+    now = [0.0]
+
+    async def check() -> PingResult:
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.01)
+        return PingResult(True, "m", 1.0, True, 200)
+
+    cache = CachedCheck(60, clock=lambda: now[0])
+    results = await asyncio.gather(*(cache.get(check) for _ in range(5)))
+    assert calls == 1 and all(r.ok for r, _ in results)
+    assert sorted(age is None for _, age in results) == [False] * 4 + [True]  # one fresh
+    now[0] = 59
+    assert (await cache.get(check))[1] == 59 and calls == 1
+    now[0] = 61
+    assert (await cache.get(check))[1] is None and calls == 2
 
 
 # ----------------------------------------------------------------------------- body limits
@@ -256,6 +373,17 @@ def test_cors_origins_parse(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _settings().CORS_ORIGINS == ["https://a.example", "https://b.example"]
     monkeypatch.setenv("CORS_ORIGINS", '["https://c.example"]')
     assert _settings().CORS_ORIGINS == ["https://c.example"]
+
+
+def test_pasted_keys_are_stripped(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A trailing newline in the key made every Groq call fail with APIConnectionError.
+    monkeypatch.setenv("GROQ_API_KEY", " gsk_abc123\n")
+    monkeypatch.setenv("SAFE_BROWSING_API_KEY", "AIza-key\r\n")
+    monkeypatch.setenv("GROQ_MODEL", "openai/gpt-oss-120b ")
+    settings = _settings()
+    assert settings.GROQ_API_KEY == "gsk_abc123"
+    assert settings.SAFE_BROWSING_API_KEY == "AIza-key"
+    assert settings.GROQ_MODEL == "openai/gpt-oss-120b"
 
 
 def test_bad_rate_limit_fails_at_startup() -> None:

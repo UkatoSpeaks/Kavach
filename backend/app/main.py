@@ -13,7 +13,8 @@ from app.api.protection import (
     RateLimiter,
     SecurityHeadersMiddleware,
 )
-from app.api.routes import analyze, health, report
+from app.api.routes import analyze, debug, health, report
+from app.api.routes.health import LLM_CHECK_TTL_S, CachedCheck
 from app.core.config import Settings, get_settings
 from app.core.logging import RequestIDMiddleware, setup_logging
 from app.db.session import create_engine, create_sessionmaker
@@ -44,6 +45,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.reasoner = (
         GroqReasoner(
             api_key=settings.GROQ_API_KEY,
+            base_url=settings.GROQ_BASE_URL,
             model=settings.GROQ_MODEL,
             fallback_model=settings.GROQ_FALLBACK_MODEL,
             timeout_s=settings.LLM_TIMEOUT_S,
@@ -84,6 +86,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
     app.state.rate_limiter = RateLimiter()
+    app.state.llm_health = CachedCheck(LLM_CHECK_TTL_S)
     install_error_handlers(app, settings)
     # Last added = outermost. Outermost first: real client IP, security headers on every
     # response, request id + access log, CORS (so errors below are readable by browsers),
@@ -108,6 +111,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(analyze.router)
     app.include_router(report.router)
+    if settings.DEBUG_IP_ENDPOINT:
+        app.include_router(debug.router)
     return app
 
 

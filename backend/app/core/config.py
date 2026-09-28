@@ -44,6 +44,9 @@ class Settings(BaseSettings):
 
     DATABASE_URL: str
     GROQ_API_KEY: str = ""
+    # Passed to the SDK explicitly (it would otherwise read GROQ_BASE_URL from the
+    # environment itself), so /health/llm can show which host is called.
+    GROQ_BASE_URL: str = "https://api.groq.com"
     GROQ_MODEL: str = "openai/gpt-oss-120b"
     # Used when GROQ_MODEL is rate limited (429) or errors; after that, template explanations.
     GROQ_FALLBACK_MODEL: str = "openai/gpt-oss-20b"
@@ -68,12 +71,18 @@ class Settings(BaseSettings):
     RATE_LIMIT_ENABLED: bool = True
     RATE_LIMIT_ANALYZE: str = "10/minute"
     RATE_LIMIT_REPORT: str = "5/minute"
+    # /health/llm makes a real (tiny, cached for 60 s) Groq call.
+    RATE_LIMIT_HEALTH_LLM: str = "6/minute"
     # How many proxies in front of the app append to X-Forwarded-For. The header is only
-    # used when the direct peer is a private address (the platform's proxy); the client IP
-    # is then the entry this many places from the right. 0: ignore the header. On Render
-    # it is 2: the header arrives as "<client>, <Cloudflare edge>" and Render's proxy
-    # appends instead of replacing, so anything further left may be forged by the client.
+    # used when the direct peer is an internal (non-global) address, i.e. the platform's
+    # proxy; trailing internal addresses are dropped and the client IP is the entry this
+    # many places from the right. 0: ignore the header. On Render it is 2: the header
+    # arrives as "<client>, <Cloudflare edge>" and Render's proxy appends instead of
+    # replacing, so anything further left may be forged by the client.
     TRUSTED_PROXY_HOPS: int = 0
+    # Temporary diagnostic: GET /debug/client-ip (resolved IP, X-Forwarded-For hop count,
+    # worker PID). Leave off except while checking the proxy setup.
+    DEBUG_IP_ENDPOINT: bool = False
     # Request body limits: JSON bodies, and multipart uploads (the QR image plus form overhead).
     MAX_JSON_BODY_BYTES: int = 64 * 1024
     MAX_UPLOAD_BODY_BYTES: int = 5 * 1024 * 1024 + 64 * 1024
@@ -166,7 +175,22 @@ class Settings(BaseSettings):
             return [o.strip().rstrip("/") for o in v.split(",") if o.strip()]
         return v
 
-    @field_validator("RATE_LIMIT_ANALYZE", "RATE_LIMIT_REPORT")
+    @field_validator(
+        "GROQ_API_KEY",
+        "GROQ_BASE_URL",
+        "GROQ_MODEL",
+        "GROQ_FALLBACK_MODEL",
+        "SAFE_BROWSING_API_KEY",
+        mode="before",
+    )
+    @classmethod
+    def _strip(cls, v: object) -> object:
+        # Values pasted into a dashboard often carry a trailing newline or space. In an API
+        # key that makes the Authorization header illegal, which httpx rejects before
+        # sending and the Groq SDK reports as APIConnectionError, not as a bad key.
+        return v.strip() if isinstance(v, str) else v
+
+    @field_validator("RATE_LIMIT_ANALYZE", "RATE_LIMIT_REPORT", "RATE_LIMIT_HEALTH_LLM")
     @classmethod
     def _valid_rate(cls, v: str) -> str:
         parse_many(v)  # ValueError on bad notation: fail at startup, not on the first request

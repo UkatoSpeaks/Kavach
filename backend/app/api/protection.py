@@ -31,12 +31,15 @@ logger = logging.getLogger(__name__)
 # ----------------------------------------------------------------------------- client IP
 
 
-def _is_private(host: str) -> bool:
+def is_internal(host: str) -> bool:
+    """Not a public internet address: private, loopback, link-local, or the 100.64.0.0/10
+    shared range that platforms use internally (Python counts that one as neither private
+    nor global)."""
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
         return False
-    return ip.is_private or ip.is_loopback
+    return not ip.is_global
 
 
 def _valid_ip(host: str) -> bool:
@@ -47,17 +50,27 @@ def _valid_ip(host: str) -> bool:
     return True
 
 
+def forwarded_hops(forwarded_for: list[str]) -> list[str]:
+    """All X-Forwarded-For entries, repeated headers joined in order."""
+    return [h.strip() for value in forwarded_for for h in value.split(",") if h.strip()]
+
+
 def forwarded_client(peer: str, forwarded_for: list[str], trusted_hops: int) -> str | None:
     """The client IP from X-Forwarded-For, or None to keep the peer address.
 
-    Only trusted when the direct peer is a private address (the platform's proxy; the app
-    isn't reachable any other way on Render). Proxies append, so the last `trusted_hops`
-    entries were written by them and anything further left may be the client's own
-    forgery: take the entry `trusted_hops` from the right, never the leftmost.
+    Only trusted when the direct peer is internal (the platform's proxy; the app isn't
+    reachable any other way on Render). Proxies append, so the last `trusted_hops` entries
+    were written by them and anything further left may be the client's own forgery: take
+    the entry `trusted_hops` from the right, never the leftmost. Trailing internal
+    addresses (a platform proxy adding its own hop) are dropped first, so an extra
+    internal hop can't shift the pick onto the Cloudflare edge IP; a client can't add
+    entries to the right of the ones proxies append.
     """
-    if trusted_hops <= 0 or not _is_private(peer):
+    if trusted_hops <= 0 or not is_internal(peer):
         return None
-    hops = [h.strip() for value in forwarded_for for h in value.split(",") if h.strip()]
+    hops = forwarded_hops(forwarded_for)
+    while hops and is_internal(hops[-1]):
+        hops.pop()
     if not hops:
         return None
     candidate = hops[-trusted_hops] if len(hops) >= trusted_hops else hops[0]
@@ -81,8 +94,9 @@ class ProxyHeadersMiddleware:
             peer = scope["client"][0] if scope.get("client") else ""
             headers = Headers(scope=scope)
             client = forwarded_client(peer, headers.getlist("x-forwarded-for"), self.trusted_hops)
+            scope = dict(scope, proxy_peer=peer)  # for GET /debug/client-ip
             if client is not None:
-                scope = dict(scope, client=(client, 0))
+                scope["client"] = (client, 0)
                 proto = headers.get("x-forwarded-proto", "").split(",")[-1].strip()
                 if proto in ("http", "https"):
                     scope["scheme"] = proto

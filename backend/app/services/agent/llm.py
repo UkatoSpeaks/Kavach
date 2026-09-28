@@ -12,6 +12,10 @@ Call policy (at most two calls per analysis, each with an LLM_TIMEOUT_S timeout)
 Successful results are cached in-process (LRU + TTL) to protect the free-tier quota. The
 cache key is a hash of the normalized text plus a summary of the signals, flags and patterns
 the prompt is built from.
+
+Network errors are noted with their underlying cause (the SDK wraps every transport failure,
+even a malformed request header, in APIConnectionError) and logged with the sanitized cause
+chain, e.g. "APIConnectionError <- httpx.ConnectError <- ssl.SSLCertVerificationError: ...".
 """
 
 import asyncio
@@ -42,6 +46,11 @@ MAX_EXPLANATION_WORDS = 90
 MAX_ADVICE_WORDS = 30
 MAX_TOKENS = 900
 TEMPERATURE = 0.2
+# /health/llm's connectivity check: a reply this short is enough (it may be cut off).
+PING_MAX_TOKENS = 16
+MAX_ERROR_MESSAGE_CHARS = 200
+# Groq keys and bearer tokens, should an error message quote a request header.
+_SECRET = re.compile(r"gsk_[A-Za-z0-9]+|Bearer\s+\S+", re.IGNORECASE)
 # Contact details the model may always mention (see prompts.SYSTEM_PROMPT).
 ALLOWED_DOMAINS = frozenset({"cybercrime.gov.in"})
 _DEVANAGARI = re.compile(r"[ऀ-ॿ]")
@@ -286,7 +295,75 @@ class LRUTTLCache(Generic[V]):
         return len(self._data)
 
 
+# --------------------------------------------------------------------------- errors
+
+
+@dataclass(frozen=True)
+class ErrorInfo:
+    """An exception and the exceptions it wraps, safe to log or return."""
+
+    error_class: str  # e.g. APIConnectionError
+    causes: tuple[str, ...]  # wrapped classes, outermost first, e.g. ("httpx.ConnectError", ...)
+    message: str  # the innermost non-empty message, secrets removed
+
+    @property
+    def root_class(self) -> str:
+        return self.causes[-1] if self.causes else self.error_class
+
+    def __str__(self) -> str:
+        chain = " <- ".join((self.error_class, *self.causes))
+        return f"{chain}: {self.message}" if self.message else chain
+
+
+def _qualified_name(exc: BaseException) -> str:
+    cls = type(exc)
+    package = cls.__module__.split(".")[0]
+    return cls.__name__ if package == "builtins" else f"{package}.{cls.__name__}"
+
+
+def sanitize(text: str, secrets: Sequence[str] = ()) -> str:
+    """One line, at most MAX_ERROR_MESSAGE_CHARS, with the given secrets and anything that
+    looks like a Groq key or bearer token replaced. Pure."""
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "[redacted]")
+    text = " ".join(_SECRET.sub("[redacted]", text).split())
+    if len(text) > MAX_ERROR_MESSAGE_CHARS:
+        text = text[: MAX_ERROR_MESSAGE_CHARS - 1] + "…"
+    return text
+
+
+def describe_error(exc: BaseException, secrets: Sequence[str] = ()) -> ErrorInfo:
+    """Follows __cause__ (or the implicit __context__) down to the root: that is where the
+    real reason is (ConnectTimeout vs ConnectError vs an SSL or DNS error). Pure."""
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    while current is not None and current not in chain and len(chain) < 8:
+        chain.append(current)
+        current = current.__cause__ or (
+            None if current.__suppress_context__ else current.__context__
+        )
+    messages = [str(e) for e in chain if str(e)]
+    return ErrorInfo(
+        error_class=type(exc).__name__,
+        causes=tuple(_qualified_name(e) for e in chain[1:]),
+        message=sanitize(messages[-1], secrets) if messages else "",
+    )
+
+
 # --------------------------------------------------------------------------- reasoner
+
+
+@dataclass(frozen=True)
+class PingResult:
+    """One connectivity check (see GroqReasoner.ping)."""
+
+    ok: bool
+    model: str
+    elapsed_ms: float
+    reachable: bool  # Groq answered at all, even with an error status
+    status_code: int | None = None
+    error: ErrorInfo | None = None
 
 
 @dataclass(frozen=True)
@@ -321,13 +398,50 @@ class GroqReasoner:
     reasoning_effort: Literal["low", "medium", "high"] | None = None
     cache: LRUTTLCache[ReasonResult] = field(default_factory=lambda: LRUTTLCache(500, 3600))
     client: groq.AsyncGroq | None = None
+    base_url: str | None = None  # None: the SDK's default (or GROQ_BASE_URL from the env)
 
     def __post_init__(self) -> None:
         if self.client is None:
-            # Retries are ours (see module docstring), not the SDK's.
+            # Created once per process and shared, so its connection pool is reused.
+            # Retries are ours (see module docstring), not the SDK's. The httpx timeout is
+            # per phase (connect incl. TLS, each read, ...); _complete caps the whole call.
             self.client = groq.AsyncGroq(
-                api_key=self.api_key, max_retries=0, timeout=self.timeout_s
+                api_key=self.api_key,
+                base_url=self.base_url,
+                max_retries=0,
+                timeout=self.timeout_s,
             )
+
+    def describe(self, exc: BaseException) -> ErrorInfo:
+        return describe_error(exc, secrets=[self.api_key])
+
+    def _extra(self) -> dict[str, Any]:
+        return {"reasoning_effort": self.reasoning_effort} if self.reasoning_effort else {}
+
+    async def ping(self) -> PingResult:
+        """One tiny completion with GROQ_MODEL through the same client the analyses use, for
+        /health/llm. Never raises."""
+        assert self.client is not None
+        start = time.perf_counter()
+
+        def done(ok: bool, reachable: bool, **kw: Any) -> PingResult:
+            elapsed = round((time.perf_counter() - start) * 1000, 1)
+            return PingResult(ok, self.model, elapsed, reachable, **kw)
+
+        try:
+            async with asyncio.timeout(self.timeout_s + 1):
+                await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": "Reply with: ok"}],
+                    max_tokens=PING_MAX_TOKENS,
+                    timeout=self.timeout_s,
+                    **self._extra(),
+                )
+        except groq.APIStatusError as exc:
+            return done(False, True, status_code=exc.status_code, error=self.describe(exc))
+        except Exception as exc:  # fail soft: the error is the result
+            return done(False, False, error=self.describe(exc))
+        return done(True, True, status_code=200)
 
     async def reason(self, evidence: Evidence) -> ReasonResult:
         if (hit := self.cache.get(evidence.cache_key)) is not None:
@@ -339,9 +453,6 @@ class GroqReasoner:
 
     async def _complete(self, model: str, messages: list[dict[str, str]]) -> str:
         assert self.client is not None
-        extra: dict[str, Any] = {}
-        if self.reasoning_effort is not None:
-            extra["reasoning_effort"] = self.reasoning_effort
         async with asyncio.timeout(self.timeout_s + 1):  # guard on top of the SDK timeout
             resp = await self.client.chat.completions.create(
                 model=model,
@@ -350,7 +461,7 @@ class GroqReasoner:
                 temperature=TEMPERATURE,
                 max_tokens=MAX_TOKENS,
                 timeout=self.timeout_s,
-                **extra,
+                **self._extra(),
             )
         choice = resp.choices[0]
         if choice.finish_reason == "length":
@@ -361,6 +472,7 @@ class GroqReasoner:
         messages = prompts.messages(evidence.payload, evidence.message)
         model = self.model
         notes: list[str] = []
+        errors: list[str] = []  # full sanitized cause chains of network errors, for the log
         for _ in range(2):
             try:
                 raw = await self._complete(model, messages)
@@ -370,8 +482,14 @@ class GroqReasoner:
                 messages = [*messages, {"role": "user", "content": prompts.IDENTIFIER_RETRY_NOTE}]
             except InvalidOutput as exc:
                 notes.append(f"{model}: invalid output ({exc})")
-            except (TimeoutError, groq.APITimeoutError):
-                notes.append(f"{model}: timed out after {self.timeout_s:g}s")
+            except (TimeoutError, groq.APITimeoutError) as exc:
+                err = self.describe(exc)
+                # ConnectTimeout (never connected) vs ReadTimeout (slow reply); asyncio's own
+                # TimeoutError (the overall cap in _complete) has no useful cause.
+                sdk_timeout = isinstance(exc, groq.APITimeoutError) and err.causes
+                cause = f" ({err.root_class})" if sdk_timeout else ""
+                notes.append(f"{model}: timed out after {self.timeout_s:g}s{cause}")
+                errors.append(f"{model}: {err}")
                 break
             except groq.APIStatusError as exc:
                 if _is_json_mode_failure(exc):
@@ -381,7 +499,14 @@ class GroqReasoner:
                 notes.append(f"{model}: {kind} ({exc.status_code})")
                 model = self.fallback_model
             except groq.APIError as exc:
-                notes.append(f"{model}: {type(exc).__name__}")
+                err = self.describe(exc)
+                cause = f" ({err.root_class})" if err.causes else ""
+                notes.append(f"{model}: {type(exc).__name__}{cause}")
+                errors.append(f"{model}: {err}")
                 model = self.fallback_model
-        logger.warning("llm step fell back to templates: %s", "; ".join(notes))
+        logger.warning(
+            "llm step fell back to templates: %s%s",
+            "; ".join(notes),
+            f" | causes: {' ; '.join(errors)}" if errors else "",
+        )
         return ReasonResult(None, None, tuple(notes))

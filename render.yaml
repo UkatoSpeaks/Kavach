@@ -28,11 +28,12 @@ services:
       uv sync --frozen --no-dev &&
       .venv/bin/python -m scripts.download_model &&
       .venv/bin/alembic upgrade head
-    # One worker: the rate limits and LLM cache are in-process, and 512 MB is tight.
+    # One worker: the rate limits and LLM cache are in-process, and 512 MB is tight. Explicit,
+    # because without --workers uvicorn uses $WEB_CONCURRENCY when the platform sets it.
     # --no-proxy-headers: uvicorn would take the client IP from the leftmost, client-forgeable
     # X-Forwarded-For entry; the app does it correctly instead (TRUSTED_PROXY_HOPS).
     startCommand: >-
-      .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port $PORT
+      .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
       --no-proxy-headers --no-server-header
     healthCheckPath: /health
     envVars:
@@ -80,6 +81,8 @@ services:
         value: "2"
       - key: ENABLE_DOCS
         value: "false"
+      # Not listed here (default off, and a Blueprint value would override the dashboard):
+      # DEBUG_IP_ENDPOINT=true enables GET /debug/client-ip while checking the proxy setup.
       # For the future frontend, add in the dashboard: CORS_ORIGINS=https://your-frontend.example
       # (comma-separated). Unset = no browser origins allowed.
 

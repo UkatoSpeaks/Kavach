@@ -19,11 +19,14 @@ from app.services.agent.llm import (
     LRUTTLCache,
     altered_identifiers,
     build_evidence,
+    describe_error,
     parse_assessment,
+    sanitize,
 )
 from app.services.pipeline import Timer, extract_step
 from app.services.scoring import rules_signal
 from tests.examples import SCAM_EXAMPLES
+from tests.fakes import scripted_groq
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 PRIMARY, FALLBACK = "big-model", "small-model"
@@ -165,12 +168,70 @@ async def test_server_error_uses_fallback_model_then_templates() -> None:
     )
 
 
-@respx.mock
 async def test_timeout_falls_back_to_templates_without_retry() -> None:
-    route = respx.post(GROQ_URL).mock(side_effect=httpx.ReadTimeout("slow"))
-    result = await reasoner().reason(EVIDENCE)
-    assert result.assessment is None and route.call_count == 1
-    assert result.detail == f"{PRIMARY}: timed out after 8s; using template explanations"
+    client, requests = scripted_groq(httpx.ReadTimeout("slow"))
+    result = await reasoner(client=client).reason(EVIDENCE)
+    assert result.assessment is None and len(requests) == 1
+    assert result.detail == (
+        f"{PRIMARY}: timed out after 8s (httpx.ReadTimeout); using template explanations"
+    )
+
+
+async def test_connection_error_notes_and_logs_the_underlying_cause(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client, _ = scripted_groq(
+        httpx.ConnectError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+    )
+    result = await reasoner(client=client).reason(EVIDENCE)
+    assert result.assessment is None
+    assert result.notes == (
+        f"{PRIMARY}: APIConnectionError (httpx.ConnectError)",
+        f"{FALLBACK}: APIConnectionError (httpx.ConnectError)",
+    )
+    log = next(r.getMessage() for r in caplog.records if "fell back" in r.getMessage())
+    assert "APIConnectionError <- httpx.ConnectError: [SSL: CERTIFICATE_VERIFY_FAILED]" in log
+
+
+def test_describe_error_follows_the_cause_chain_and_hides_secrets() -> None:
+    try:
+        try:
+            raise OSError("Illegal header value b'Bearer gsk_Abc123\\n' for test-key-xyz")
+        except OSError as inner:
+            raise httpx.ConnectError("wrapped") from inner
+    except httpx.ConnectError as exc:
+        info = describe_error(exc, secrets=["test-key-xyz"])
+    assert info.error_class == "ConnectError"
+    assert info.causes == ("OSError",) and info.root_class == "OSError"
+    assert "gsk_" not in info.message and "test-key-xyz" not in info.message
+    assert info.message == "Illegal header value b'[redacted] for [redacted]"
+
+
+def test_sanitize_truncates_to_one_short_line() -> None:
+    out = sanitize("line one\nline two " + "x" * 500)
+    assert "\n" not in out and len(out) == 200 and out.endswith("…")
+
+
+@respx.mock
+async def test_ping_ok() -> None:
+    route = respx.post(GROQ_URL).mock(return_value=httpx.Response(200, json=completion("ok")))
+    result = await reasoner(reasoning_effort="low").ping()
+    assert result.ok and result.reachable and result.status_code == 200 and result.error is None
+    body = json.loads(route.calls[0].request.content)
+    assert body["model"] == PRIMARY and body["max_tokens"] <= 16
+    assert body["reasoning_effort"] == "low"
+
+
+async def test_ping_reports_status_and_network_errors() -> None:
+    client, _ = scripted_groq(error(401, "invalid_api_key"), httpx.ConnectTimeout("connect"))
+    r = reasoner(client=client)
+    bad_key = await r.ping()
+    assert not bad_key.ok and bad_key.reachable and bad_key.status_code == 401
+    assert bad_key.error is not None and bad_key.error.error_class == "AuthenticationError"
+    down = await r.ping()
+    assert not down.ok and not down.reachable and down.status_code is None
+    assert down.error is not None and down.error.error_class == "APITimeoutError"
+    assert down.error.causes == ("httpx.ConnectTimeout",)
 
 
 @respx.mock

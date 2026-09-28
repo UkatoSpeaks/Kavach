@@ -11,6 +11,9 @@ from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any
 
+import groq
+import httpx
+
 from app.core.enums import EntityType
 from app.db.models import ReportedEntity
 from app.services import rag
@@ -19,6 +22,25 @@ from app.services.embeddings import EmbeddingUnavailable, unit
 from app.services.knowledge_base import PatternDoc, load_docs
 from app.services.reputation import normalize
 from scripts.seed_reported import DEMO_ENTITIES
+
+
+def scripted_groq(
+    *outcomes: httpx.Response | Exception, api_key: str = "test-key"
+) -> tuple[groq.AsyncGroq, list[httpx.Request]]:
+    """A real Groq SDK client whose transport returns or raises `outcomes` in order (the
+    last one repeats), plus the requests it received. Unlike respx, a raised exception
+    reaches the SDK as is, so error cause chains look like production's."""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        outcome = outcomes[min(len(requests), len(outcomes)) - 1]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return groq.AsyncGroq(api_key=api_key, max_retries=0, http_client=http), requests
 
 
 class FakeSession:
