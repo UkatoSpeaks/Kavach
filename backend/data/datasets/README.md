@@ -234,8 +234,8 @@ TF-IDF on `features.preprocess` text (char 2-5 grams inside words + word 1-2 gra
 Indian rows ×5. C chosen on val by macro-F1; one temperature fitted on val. Exported as JSON
 (`models/classifier.json`, 4.1 MB, 80,000 features) and run with numpy in the service; the
 export is checked against scikit-learn on 200 val messages at every training run (and by a
-unit test). It adds about 14 MB to the service's RSS (31 MB at peak while loading), see the
-main README.
+unit test). It adds about 14 MB to the service's RSS (31 MB at peak while loading), see
+[docs/DEPLOYMENT.md](../../../docs/DEPLOYMENT.md#memory-measured-locally-windows-python-312-one-uvicorn-worker).
 
 **Your collected messages never train it.** `prepare_dataset` puts every collected
 message (and its template group) in `test.csv` or `heldout.csv`, `train_classifier` refuses

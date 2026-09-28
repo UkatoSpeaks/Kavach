@@ -38,3 +38,9 @@ Thumbs.db
 
 # Local model caches (fastembed downloads)
 backend/.cache/
+
+
+CLAUDE.md
+AGENTS.md
+**/CLAUDE.md
+**/AGENTS.md

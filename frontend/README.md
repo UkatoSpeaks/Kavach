@@ -10,4 +10,4 @@ npm run build
 npm run lint
 ```
 
-See the "Frontend" section of the repo's `CLAUDE.md` for the design system and folder layout.
+Design tokens (colours, fonts, type scale, shadows) live in `app/globals.css`. Setup and deployment: [docs/DEVELOPMENT.md](../docs/DEVELOPMENT.md) and [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md#deploy-the-frontend-to-vercel).

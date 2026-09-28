@@ -1,4 +1,4 @@
-"""The AnalysisResult contract returned by every analysis endpoint (see CLAUDE.md)."""
+"""The AnalysisResult contract returned by every analysis endpoint."""
 
 from datetime import datetime
 from typing import Literal

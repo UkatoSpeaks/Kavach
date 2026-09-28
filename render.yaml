@@ -1,5 +1,5 @@
 # Render Blueprint: the Kavach API as a free native-Python web service (no Docker).
-# Step-by-step deploy instructions: README.md -> "Deploy to Render".
+# Step-by-step deploy instructions: docs/DEPLOYMENT.md -> "Deploy the backend to Render".
 services:
   - type: web
     name: kavach-api
@@ -23,7 +23,7 @@ services:
     # 2. Download the embedding model into backend/.cache/fastembed, which ships with the
     #    build (skipped while PATTERN_SIGNAL_ENABLED=false).
     # 3. Migrate the database LAST, so a failed install/download never leaves the schema
-    #    ahead of the running code. Pre-deploy commands are paid-only; see README.
+    #    ahead of the running code. Pre-deploy commands are paid-only; see docs/DEPLOYMENT.md.
     buildCommand: >-
       uv sync --frozen --no-dev &&
       .venv/bin/python -m scripts.download_model &&
