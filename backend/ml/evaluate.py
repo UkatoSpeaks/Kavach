@@ -2,7 +2,8 @@
 ml/reports/<date>_<name>.md.
 
 Modes (--modes, comma-separated):
-- rules:  extractors + rules + UPI check (pipeline.analyze_text). Pure, offline.
+- rules:  extractors + rules + UPI check + the trained classifier (pipeline.analyze_text;
+          CLASSIFIER_ENABLED=false for rules alone). Pure, offline.
 - checks: the agent graph with explain=false: rules + pattern similarity (local fastembed
           model, knowledge base retrieved in memory, no database) + url_intel/reputation
           when --network is given. No LLM.

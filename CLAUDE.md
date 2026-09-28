@@ -14,7 +14,7 @@ and returns an explainable scam verdict for Indian users. Differentiators:
 ## Hard constraints
 
 - **No Docker.** The developer's machine has limited disk space. Never add Dockerfiles, docker-compose, or instructions that require Docker.
-- **Keep local installs light.** Do NOT add `torch`, `tensorflow`, or `sentence-transformers` to the backend. Embeddings are computed locally with `fastembed` (ONNX, no torch); the classifier will be served with `onnxruntime`. Training happens separately on Google Colab.
+- **Keep local installs light.** Do NOT add `torch`, `tensorflow`, or `sentence-transformers` to the backend. Embeddings are computed locally with `fastembed` (ONNX, no torch); the TF-IDF classifier runs from a JSON export with numpy (scikit-learn is dev-only, for training); a future transformer would be served with `onnxruntime`. Transformer training happens separately on Google Colab.
 - **Free tier only.** Database = Supabase (hosted Postgres + pgvector). LLM = Groq free tier. No paid services.
 - **No Redis for now.** Cache in Postgres (`url_cache` table) or an in-process TTL cache.
 
@@ -68,22 +68,34 @@ backend/
       embeddings.py         # local fastembed wrapper (background load, fails soft)
       rag.py                # pgvector retrieval -> pattern_similarity signal
       scoring.py            # combines signals -> final score + breakdown
+      features.py           # classifier preprocessing (leet folding, entity masking) + n-grams;
+                            # shared with training via ml/features.py
+      classifier.py         # TF-IDF + logreg from models/classifier.json, numpy only; the
+                            # "classifier" signal (counts only above a P(scam) threshold, no floor;
+                            # half weight on fraud-awareness notices, rules.advisory_evidence)
       explain.py            # template explanations/advice (used when the LLM is off or fails)
-      pipeline.py           # the steps: extract_step, run_checks (concurrent), finish
+      pipeline.py           # the steps: extract_step, run_checks (concurrent), classifier_step, finish
       agent/
         graph.py            # LangGraph: extract -> run_checks -> reason (LLM) -> finalize
         nodes.py            # graph nodes (thin wrappers over pipeline.py)
         state.py            # AnalysisState, AnalysisContext
         llm.py              # GroqReasoner: retries, fallback model, output validation, LRU+TTL cache
         prompts.py          # system prompt (injection defences, Hindi style, identifier rule)
-      # planned: classifier.py (ONNX inference), ocr.py (screenshot -> text)
+      # planned: ocr.py (screenshot -> text)
   alembic/
   data/
     scam_patterns/          # markdown knowledge-base docs (scam + genuine patterns)
     datasets/               # raw + processed training data (gitignored if large)
-  ml/                       # eval_retrieval.py; Colab notebooks later
+  models/classifier.json    # the trained classifier (ml/train_classifier.py)
+  ml/                       # datasets (download_public, prepare_dataset, generate_synthetic),
+                            # train_classifier.py, eval_classifier.py, disagreements.py,
+                            # evaluate.py (full pipeline), train_transformer.ipynb (Colab, MuRIL);
+                            # scikit-learn is a dev dependency only; see data/datasets/README.md.
+                            # data/datasets/collected/ is test-only: never train/val (a test checks
+                            # the model has no n-gram only those messages contain)
   scripts/                  # ingest_patterns.py (embed KB into pgvector), seed_reported.py,
-                            # download_model.py (build step: fastembed model into the cache dir)
+                            # download_model.py (build step: fastembed model into the cache dir),
+                            # measure_memory.py (RSS after startup / N analyses)
   tests/
     conftest.py             # make_client (no DB), make_db_client (rolled-back DB), fake DNS
     fakes.py                # FakeSession, InMemoryReputation, FakeEmbedder, FakeReasoner, ...

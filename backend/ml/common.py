@@ -55,7 +55,7 @@ REVIEWED_SOURCES = ("manual", "assisted")
 # The unified schema of every processed CSV.
 COLUMNS = (
     "id", "text", "label", "original_label", "scam_type", "language", "source", "dataset",
-    "is_synthetic", "is_indian", "label_source", "parent_id", "split",
+    "is_synthetic", "is_indian", "label_source", "parent_id", "split", "group",
 )  # fmt: skip
 
 _DEVA_RE = re.compile(r"[ऀ-ॿ]")

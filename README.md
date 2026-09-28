@@ -110,7 +110,12 @@ Set `ENV=prod` (or `ENV=production`). Every setting is listed in `backend/.env.e
 | | after startup | after 20 analyses |
 |---|---|---|
 | `PATTERN_SIGNAL_ENABLED=true` (model loaded) | ~680 MB RSS | ~690 MB RSS |
-| `PATTERN_SIGNAL_ENABLED=false` | ~116 MB RSS | ~123 MB RSS |
+| `PATTERN_SIGNAL_ENABLED=false`, `CLASSIFIER_ENABLED=false` | ~120 MB RSS | ~122 MB RSS |
+| `PATTERN_SIGNAL_ENABLED=false`, classifier on (the Render setup) | ~134 MB RSS | ~136 MB RSS (peak 153 MB while loading) |
+
+The classifier rows come from `uv run python -m scripts.measure_memory [--no-classifier]`
+(the real app and route, `POST /analyze/text?explain=false`, no database or network). The
+classifier costs about 14 MB, plus ~30 MB for a moment while its JSON is parsed at startup.
 
 The ONNX model accounts for about 560 MB of that, including the onnxruntime import. Turning
 off onnxruntime's memory arena and using a single thread didn't change it. The free Render
@@ -118,6 +123,46 @@ instance has 512 MB, so `render.yaml` sets `PATTERN_SIGNAL_ENABLED=false`. To br
 signal back, move to an instance with at least 1 GB of RAM or switch to a smaller or
 quantized embedding model. A new model needs a migration if its dimension changes, plus a
 re-run of `scripts.ingest_patterns`.
+
+## Scam classifier
+
+A TF-IDF (character + word n-grams) logistic-regression model trained on public smishing
+data (IMC 2025 reports, Mendeley, India Spam SMS) plus synthetic hard negatives, exported
+to `backend/models/classifier.json` (4 MB) and run with numpy. It is the `classifier`
+signal: 100 × P(scam), counted only when P(scam) ≥ 0.9, never setting a minimum score, and
+with half its weight on fraud-awareness notices ("SBI never asks for your OTP"). Your own
+collected messages are test-only: they never train it. Data, splits and training:
+`backend/data/datasets/README.md`; `ml/train_classifier.py`, `ml/eval_classifier.py`.
+Render needs `backend/models/classifier.json` committed; without it the signal is reported
+unavailable and everything else works.
+
+Held-out Indian messages (447: 155 scams, 206 genuine, 86 promotions), 95% intervals:
+
+| | precision | scam recall | false-positive rate | FPR at 90% recall |
+|---|---:|---:|---:|---:|
+| rules only | 98.8% | 52.9% (45–61%) | 0.3% (0–2%) | unreachable |
+| classifier only | 91.5% | 97.4% (94–99%) | 4.8% (3–8%) | 1.0% |
+| rules + classifier (what the API does) | 97.3% | 93.5% (89–96%) | 1.4% (1–3%) | 1.4% |
+
+Genuine messages flagged by the API, rules only → with the classifier: Indian 1/206 →
+1/206, UCI (UK/Singapore, never seen in training) 0/690 → 1/690. The 36 built-in examples
+keep their verdicts.
+
+**How much to trust these numbers:**
+
+- Held-out means no message and no near-duplicate template of it was used for training or
+  for choosing any setting; the threshold and model settings were chosen on a separate
+  validation split.
+- The samples are small where it matters most: 1/206 has an interval of 0–3%, so a
+  one-message difference means nothing. The frozen Indian test split (29 messages, 2 scams,
+  27 AI-assisted labels) is a smoke test, not a metric.
+- 151 of the 155 Indian held-out scams are public user reports (mostly bank KYC lures);
+  only 4 are messages the author received. v1's UPI tricks (collect requests, "scan to
+  receive", "sent by mistake") are almost absent from public data, so for those the rules do
+  the work, and the recall above says little about them.
+- Some labels are circular or noisy: Indian promotions were largely labelled by a script
+  built on the same rules (flattering the rules' 0% promo false-positive rate), and the
+  public datasets' scam labels are user reports.
 
 ## Deploy to Render (free, no Docker)
 
@@ -266,9 +311,11 @@ on `backend/uv.lock`.
 - **Supabase region latency:** each analysis makes several database round trips (URL cache,
   reputation, background save). If Render and Supabase are in different regions, each trip
   adds about 100–250 ms. Keep them in the same region (see step 2).
-- **No classifier yet:** the `classifier` signal is always unavailable, and its weight (0.25)
-  is spread over the other signals until the ONNX model is trained. The pattern-similarity
-  signal is also off on the free instance, for memory reasons.
+- **Classifier coverage:** the classifier learned mostly from public, largely non-Indian
+  smishing reports. It still rates some genuine Indian transactional messages as likely
+  scams (a UPI debit alert 0.72, a food-delivery update 0.68, an SBI "visit your branch for
+  KYC" reminder 0.86), which is why it only counts from 0.9 (see "Scam classifier"). The pattern-similarity signal is off on the free instance, for memory
+  reasons.
 - **Supabase free projects pause** after about a week without activity. `/health/db` then
   reports an error, and analyses carry on without reputation, cache and saving until you
   restore the project in the Supabase dashboard.

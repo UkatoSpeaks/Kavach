@@ -1,10 +1,15 @@
-"""Synthetic training data from Groq: variations of real collected scams + hard negatives.
+"""Synthetic training data from Groq: variations of real scams + hard negatives.
 
-- Variations: for every REAL scam message in processed/train.csv (never val/test), one call
-  asks for an English paraphrase, a Hinglish version, a Hindi (Devanagari) version and one
-  with a different amount and brand. Same scam mechanics, same scam_type.
+- Variations: for REAL scam messages in processed/train.csv (never val/test/heldout), one
+  call asks for an English paraphrase, a Hinglish version, a Hindi (Devanagari) version and
+  one with a different amount and brand. Same scam mechanics, same scam_type. One parent
+  per template group (a template repeated 400 times gets one call, not 400), Indian ones
+  first: India Spam SMS, IMC25 rows from Indian networks, then the rest (other IMC25 rows,
+  Mendeley). Never your collected messages: they are test-only and not in train.
 - Hard negatives: genuine-looking bank alerts, OTPs, courier updates, KYC reminders and
-  receipts, the messages a detector wrongly flags.
+  receipts (label genuine), and brand promotions (label promo_spam): the messages a
+  detector wrongly flags. They are interleaved with the variations, so even a small
+  --max-calls budget produces both.
 
 Everything is tagged is_synthetic=true and appended to data/datasets/synthetic/generated.csv.
 ml/prepare_dataset.py puts it in the train split only (and drops anything too close to a
@@ -52,7 +57,37 @@ HARD_NEGATIVE_KINDS = {
                        "and refund-processed notices from real services",
     "personal": "ordinary personal WhatsApp messages about money between family and friends "
                 "(splitting a bill, 'sent you ₹500 for groceries'), in English and Hinglish",
+    "brand_promo": "legitimate promotions from real Indian brands (Myntra, Swiggy, Zomato, "
+                   "Flipkart and Amazon sales, Jio/Airtel recharge plans, bank credit-card "
+                   "offers) with discounts, coupon codes, short links and 'T&C apply'",
+    "awareness": "fraud-awareness advisories that banks, regulators, telecoms and police send "
+                 "('X never asks for your OTP/PIN/password', 'do not click unknown links', "
+                 "'beware of fake KYC update calls', 'report fraud at 1930 or "
+                 "cybercrime.gov.in'). Mix short one-liners and longer notices",
 }  # fmt: skip
+# Rotated per round so the batches differ: who sends the advisory and what it warns about.
+AWARENESS_FOCUS = (
+    "SBI: never share OTP, PIN or CVV", "HDFC Bank: fake KYC update calls and SMS",
+    "ICICI Bank: do not click links in SMS claiming your account is blocked",
+    "Axis Bank and Kotak: remote screen-sharing apps", "RBI: 'RBI kehta hai', beware of "
+    "fraudsters posing as RBI officials", "NPCI/BHIM UPI: you never enter a UPI PIN to "
+    "receive money", "Paytm/PhonePe/Google Pay: never scan a QR code to receive money",
+    "TRAI: TRAI never calls to disconnect your number", "DoT and Sanchar Saathi: report "
+    "fraud calls on Chakshu", "Jio: beware of SIM-block and KYC calls", "Airtel: do not "
+    "share OTP with anyone claiming to be Airtel", "Vi: fake recharge and prize SMS",
+    "State police cyber cell: call 1930 within the golden hour", "Mumbai/Delhi police "
+    "cyber cell: fake courier and customs calls", "UIDAI: never share Aadhaar OTP, lock "
+    "biometrics", "Income Tax Department: fake refund SMS", "EPFO: never asks for UAN "
+    "password or OTP", "Electricity board: no disconnection SMS from mobile numbers",
+    "Parivahan: pay e-challans only on the official site", "India Post: no customs fee by "
+    "SMS link", "Amazon/Flipkart: fake job and task offers", "Your company's IT/HR team: "
+    "phishing emails and fake job offers", "CERT-In: install apps only from Play Store",
+    "Credit card issuers: card-limit upgrade calls", "Insurance/LIC: fake policy bonus calls",
+)  # fmt: skip
+# Hard-negative kinds that are promotions, not ordinary messages.
+PROMO_KINDS = frozenset({"brand_promo"})
+# Order in which real parents are used: Indian sources first.
+PARENT_PRIORITY = {"india_spam_sms": 0, "imc25_smishing:india": 1}
 
 SYSTEM = (
     "You generate training data for an Indian scam-message detector. Output JSON only. "
@@ -78,6 +113,11 @@ They must be safe, but look like what people wrongly report as scams. Mix Englis
 and a few in Hindi (Devanagari). Vary banks, apps, amounts and dates.
 Return {{"messages": [{{"text": "..."}}, ...]}}"""
 
+PROMO_PROMPT = """Write {n} different Indian promotional SMS: {desc}.
+They are real marketing, NOT scams: no requests for OTP/PIN/KYC, no fake prizes. Mix English,
+Hinglish and a few in Hindi (Devanagari). Vary brands, offers, amounts and dates.
+Return {{"messages": [{{"text": "..."}}, ...]}}"""
+
 
 @dataclass(frozen=True)
 class Task:
@@ -89,39 +129,78 @@ class Task:
     kind: str
 
 
+def _priority(row: dict[str, str]) -> int:
+    key = row["dataset"]
+    if key == "imc25_smishing" and as_bool(row.get("is_indian")):
+        key += ":india"
+    return PARENT_PRIORITY.get(key, len(PARENT_PRIORITY))
+
+
 def load_parents(train_file: Path = PROCESSED_DIR / "train.csv") -> list[dict[str, str]]:
-    """Real (non-synthetic) scam messages from the train split."""
+    """Real (non-synthetic) scam messages from the train split, one per template group,
+    Indian sources first (then by id, so the order is fixed)."""
     if not train_file.exists():
         return []
-    return [
+    rows = [
         r
         for r in read_csv(train_file)
-        if r["label"] == "scam" and not as_bool(r["is_synthetic"]) and r["dataset"] == "collected"
+        if r["label"] == "scam" and not as_bool(r["is_synthetic"]) and r["dataset"] != "collected"
     ]
+    rows.sort(key=lambda r: (_priority(r), r["id"]))
+    parents, groups = [], set()
+    for r in rows:
+        group = r.get("group") or r["id"]
+        if group not in groups:
+            groups.add(group)
+            parents.append(r)
+    return parents
+
+
+def _variation(p: dict[str, str]) -> Task:
+    return Task(
+        key=f"var:{p['id']}",
+        prompt=VARIATION_PROMPT.format(
+            label=p["label"],
+            scam_type=p["scam_type"] or p.get("original_label") or "generic",
+            text=p["text"],
+        ),
+        label="scam",
+        scam_type=p["scam_type"] if p["scam_type"] in V1_SCAM_TYPES else "",
+        parent_id=p["id"],
+        kind="variation",
+    )
+
+
+def _hard_negative(kind: str, desc: str, rnd: int) -> Task:
+    promo = kind in PROMO_KINDS
+    prompt = PROMO_PROMPT if promo else HARD_NEGATIVE_PROMPT
+    if kind == "awareness":
+        desc += f". This batch: {AWARENESS_FOCUS[rnd % len(AWARENESS_FOCUS)]}"
+    return Task(
+        key=f"neg:{kind}:{rnd}",
+        prompt=prompt.format(n=HARD_NEGATIVES_PER_CALL, desc=desc),
+        label="promo_spam" if promo else "genuine",
+        scam_type="",
+        parent_id="",
+        kind=f"hard_negative:{kind}",
+    )
 
 
 def plan(parents: list[dict[str, str]], hard_negative_rounds: int) -> list[Task]:
-    tasks = [
-        Task(
-            key=f"var:{p['id']}",
-            prompt=VARIATION_PROMPT.format(
-                label=p["label"], scam_type=p["scam_type"] or "generic", text=p["text"]
-            ),
-            label="scam",
-            scam_type=p["scam_type"] if p["scam_type"] in V1_SCAM_TYPES else "",
-            parent_id=p["id"],
-            kind="variation",
-        )
-        for p in parents
+    """Variations in parent order, with one hard negative after every second variation
+    until they run out (then the remaining ones)."""
+    variations = [_variation(p) for p in parents]
+    negatives = [
+        _hard_negative(kind, desc, rnd)
+        for rnd in range(hard_negative_rounds)
+        for kind, desc in HARD_NEGATIVE_KINDS.items()
     ]
-    for rnd in range(hard_negative_rounds):
-        for kind, desc in HARD_NEGATIVE_KINDS.items():
-            tasks.append(Task(
-                key=f"neg:{kind}:{rnd}",
-                prompt=HARD_NEGATIVE_PROMPT.format(n=HARD_NEGATIVES_PER_CALL, desc=desc),
-                label="genuine", scam_type="", parent_id="", kind=f"hard_negative:{kind}",
-            ))  # fmt: skip
-    return tasks
+    tasks: list[Task] = []
+    for k, task in enumerate(variations):
+        tasks.append(task)
+        if k % 2 == 1 and negatives:
+            tasks.append(negatives.pop(0))
+    return tasks + negatives
 
 
 def parse_reply(raw: str, task: Task) -> list[tuple[str, str]]:
@@ -191,23 +270,32 @@ def main() -> None:
         default=2,
         help=f"calls per hard-negative kind ({HARD_NEGATIVES_PER_CALL} each)",
     )
+    parser.add_argument("--only-negatives", action="store_true",
+                        help="hard negatives only (when genuine alerts get flagged)")  # fmt: skip
+    parser.add_argument("--kinds", help=f"only these hard-negative kinds, comma-separated: "
+                        f"{','.join(HARD_NEGATIVE_KINDS)}")  # fmt: skip
     parser.add_argument("--dry-run", action="store_true", help="print the plan, call nothing")
     args = parser.parse_args()
 
     parents = load_parents()
     if not parents:
         print(
-            "No collected messages yet: there are no real scam messages in the train split.\n"
-            "Add your messages to data/datasets/collected/ (see collected_template.csv), run\n"
-            "  uv run python -m ml.prepare_dataset\n"
+            "There are no real scam messages in the train split yet. Run\n"
+            "  uv run python -m ml.download_public && uv run python -m ml.prepare_dataset\n"
             "and then this script again. Synthetic data is only ever made from real messages."
         )
         sys.exit(0)
 
     done = load_progress()
     todo = [t for t in plan(parents, args.hard_negative_rounds) if t.key not in done]
-    print(f"{len(parents)} real train scams; {len(done)} tasks done before, {len(todo)} to do; "
-          f"this run makes at most {args.max_calls} calls")  # fmt: skip
+    if args.only_negatives:
+        todo = [t for t in todo if t.kind.startswith("hard_negative")]
+    if args.kinds:
+        wanted = {f"hard_negative:{k.strip()}" for k in args.kinds.split(",")}
+        todo = [t for t in todo if t.kind in wanted]
+    indian = sum(_priority(p) < len(PARENT_PRIORITY) for p in parents)
+    print(f"{len(parents)} real train scam templates ({indian} Indian); {len(done)} tasks done "
+          f"before, {len(todo)} to do; this run makes at most {args.max_calls} calls")  # fmt: skip
     if args.dry_run:
         for t in todo[: args.max_calls]:
             print(f"  would run {t.key} ({t.kind})")

@@ -55,6 +55,9 @@ class SignalOutcome:
     can_decide_scam: bool = True  # False: must not make a result "scam" on its own
     # Left out of the score if it differs from the other signals' score by more than this.
     max_disagreement: float | None = None
+    # Multiplies the signal's configured weight for this message (e.g. 0.5: the classifier
+    # on a fraud-awareness notice, see pipeline.classifier_step).
+    weight_factor: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -104,14 +107,14 @@ def combine_signals(
     Signals with no configured weight are ignored. Failed and uninformative signals are
     listed with weight 0 so the caller can see what was checked and what was missing.
     """
-    weighted = [o for o in outcomes if weights.get(o.source, 0) > 0]
+    weighted = [o for o in outcomes if weights.get(o.source, 0) * o.weight_factor > 0]
     available = [o for o in weighted if o.score is not None and o.informative]
-    total_weight = sum(weights[o.source] for o in available)
+    total_weight = sum(weights[o.source] * o.weight_factor for o in available)
 
     breakdown: list[Signal] = []
     score = 0.0
     for o in available:
-        w = weights[o.source] / total_weight
+        w = weights[o.source] * o.weight_factor / total_weight
         score += w * o.score  # type: ignore[operator]  # filtered above
         breakdown.append(
             Signal(source=o.source, score=o.score, weight=round(w, 4), detail=o.detail)

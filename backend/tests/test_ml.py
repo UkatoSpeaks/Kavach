@@ -27,6 +27,7 @@ from ml.common import (
     write_csv,
 )
 from ml.evaluate import Item, Metrics, Prediction, balanced_sample, is_flagged, load_csv_set
+from ml.features import preprocess
 from ml.prepare_dataset import dedupe, make_splits, stratified_pick, validate_collected
 
 # ----------------------------------------------------------------------------- anonymize
@@ -629,3 +630,126 @@ def test_reports_state_label_sources_and_split_metrics() -> None:
     only_dataset = evaluate.EvalSet("india", [Item("4", "t", False, "g", "en",
                                                    label_source="dataset")], "", "")  # fmt: skip
     assert evaluate.label_note(only_dataset, "india") is None
+
+
+# ----------------------------------------------------------------------------- public datasets
+
+
+def test_mendeley_labels_are_mapped_to_ours(tmp_path: Path) -> None:
+    (tmp_path / "Dataset_5971.csv").write_text(
+        "LABEL,TEXT,URL,EMAIL,PHONE\n"
+        "ham,See you at 6,No,No,No\n"
+        "Spam,Flat 50% off on shoes today,No,No,No\n"
+        "Smishing,You have WON £1000 call 09061234567 now,No,No,Yes\n"
+        "other,dropped,No,No,No\n",
+        encoding="utf-8",
+    )
+    rows = prepare_dataset.load_mendeley(tmp_path)
+    assert [(r["label"], r["original_label"]) for r in rows] == [
+        ("genuine", "ham"), ("promo_spam", "spam"), ("scam", "smishing"),
+    ]  # fmt: skip
+    assert all(r["is_indian"] is False and r["label_source"] == "dataset" for r in rows)
+
+
+def test_imc_placeholders_become_ordinary_text() -> None:
+    neutral = prepare_dataset.neutralize_imc_placeholders
+    text = neutral("Dear <NAMED_ENTITY> your a/c blocked on <DATE_TIME> <URL>ease click, "
+                   "call <PHONE_NUMBER> ref <US_BANK_NUMBER>", shortener="bit.ly")  # fmt: skip
+    assert "<" not in text and ">" not in text
+    assert "https://bit.ly/masked" in text and "ease click" in text
+    entities = extract_entities(text)
+    assert entities.urls[0].is_shortener and entities.phones
+    assert "<url>" in preprocess(neutral("update now <URL>"))
+
+
+def test_imc_rows_keep_english_and_hindi_scams_and_flag_indian_networks(tmp_path: Path) -> None:
+    path = tmp_path / "imc.csv"
+    header = "time,text,language,url_shortener,scam_type,original_network_country\n"
+    path.write_text(
+        header
+        + "t,Dear SBI user your YONO account is blocked <URL>,English,,banking,IND\n"
+        + "t,Your parcel is held at customs pay the fee <URL>,English,,delivery,USA\n"
+        + "t,Su paquete esta retenido en aduanas <URL>,Spanish,,delivery,ESP\n"
+        + "t,40% off craft beers this weekend only <URL>,English,,spam,\n",
+        encoding="utf-8",
+    )
+    rows = prepare_dataset.load_imc25(path)
+    assert [(r["label"], r["original_label"], r["is_indian"]) for r in rows] == [
+        ("scam", "imc:banking", True), ("scam", "imc:delivery", False),
+    ]  # fmt: skip
+
+
+# ----------------------------------------------------------------------------- template groups
+
+
+def test_template_groups_join_copies_with_other_links_and_amounts() -> None:
+    a = _row("Dear SBI user your YONO account will be blocked today update PAN http://a.xyz/1")
+    b = _row("Dear SBI user your YONO account will be blocked today update PAN http://b.top/2")
+    c = _row("Dear SBI user, YONO account will be blocked today, update PAN http://c.xyz/3 now")
+    other = _row("Hi, lunch at 1?", "genuine")
+    groups = prepare_dataset.template_groups([a, b, c, other])
+    assert groups[a["id"]] == groups[b["id"]] == groups[c["id"]] != groups[other["id"]]
+
+
+def test_group_splits_never_put_one_template_in_two_splits() -> None:
+    rows = []
+    for t in range(60):
+        tag = "".join(chr(97 + d) for d in divmod(t, 26))  # digits would be masked to <num>
+        base = f"template {tag} alpha{tag} beta{tag} gamma{tag} delta{tag} your account link"
+        rows += [_row(f"{base} http://x{k}.com", label_source="dataset") for k in range(3)]
+    groups = prepare_dataset.template_groups(rows)
+    assert len(set(groups.values())) == 60
+    splits, _ = make_splits(rows, [], rebuild_test=False, test_frac=0.2, val_frac=0.2,
+                            manifest=None, today="d", groups=groups,
+                            heldout_frac=0.2)  # fmt: skip
+    where: dict[str, set[str]] = {}
+    for r in splits.train + splits.val + splits.heldout:
+        where.setdefault(r["group"], set()).add(r["split"])
+    assert all(len(s) == 1 for s in where.values())
+    assert splits.train and splits.val and splits.heldout and not splits.test
+
+
+def test_synthetic_parents_are_indian_first_and_one_per_template(tmp_path: Path) -> None:
+    rows = [
+        _row("mendeley prize lure", dataset="mendeley_sms_phishing", group="g1"),
+        _row("imc india kyc block", dataset="imc25_smishing", is_indian="true", group="g2"),
+        _row("imc india kyc block again", dataset="imc25_smishing", is_indian="true", group="g2"),
+        _row("my own scam sms", dataset="collected", is_indian="true", group="g3"),
+        _row("a genuine message", "genuine", dataset="collected", group="g4"),
+    ]
+    path = tmp_path / "train.csv"
+    write_csv(path, [dict(r, is_synthetic="false") for r in rows], COLUMNS)
+    parents = generate_synthetic.load_parents(path)
+    # Collected messages are test-only: never a parent, even if one slipped into train.
+    assert [p["dataset"] for p in parents] == ["imc25_smishing", "mendeley_sms_phishing"]
+
+    tasks = generate_synthetic.plan(parents, hard_negative_rounds=1)
+    assert [t.kind for t in tasks[:3]] == ["variation", "variation", "hard_negative:bank_alert"]
+    promo = next(t for t in tasks if t.kind == "hard_negative:brand_promo")
+    assert promo.label == "promo_spam" and "NOT scams" in promo.prompt
+
+
+def test_double_encoded_emoji_are_repaired_and_normal_text_is_untouched() -> None:
+    broken = "Wishing everyone well\xc3\xb0\xc2\x9f\xc2\x99\xc2\x8f"
+    assert prepare_dataset.fix_mojibake(broken) == "Wishing everyone well\U0001f64f"
+    assert prepare_dataset.fix_mojibake("café, ₹500 at 5 °C") == "café, ₹500 at 5 °C"
+
+
+def test_collected_messages_never_enter_train_or_val_nor_does_their_template() -> None:
+    pool = _pool(10)  # enough reviewed rows for a test split
+    mine = [_row(f"my own sms number {i} about a parcel fee", dataset="collected")
+            for i in range(12)]  # fmt: skip
+    twin = _row("my own sms number 3 about a parcel fee today", label_source="dataset")
+    others = [_row(f"public dataset scam {i} alpha beta", label_source="dataset")
+              for i in range(40)]  # fmt: skip
+    rows = pool + mine + [twin] + others
+    for groups in (None, prepare_dataset.template_groups(rows)):
+        splits, _ = make_splits(rows, [], rebuild_test=False, test_frac=0.2, val_frac=0.2,
+                                manifest=None, today="d", groups=groups,
+                                heldout_frac=0.2)  # fmt: skip
+        trainable = splits.train + splits.val
+        assert not [r for r in trainable if r.get("dataset") == "collected"]
+        placed = {r["id"] for r in splits.test + splits.heldout}
+        assert {r["id"] for r in mine} <= placed
+        if groups is not None:  # a near-copy of a collected message is held out with it
+            assert twin["id"] in placed

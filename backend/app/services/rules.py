@@ -831,3 +831,52 @@ def evaluate(entities: ExtractedEntities, rules: Iterable[Rule] = RULES) -> Rule
 
 def _max_weight(hits: list[RuleHit], scam_type: ScamType) -> float:
     return max(h.rule.weight for h in hits if h.rule.scam_type is scam_type)
+
+
+# =========================================================================== advisories
+
+# Fraud-awareness wording: "SBI never asks for your OTP", "do not share your PIN", "beware
+# of KYC calls", "report fraud at 1930". Not a rule (it never scores anything): it only
+# tells the classifier signal that the message warns about scams rather than being one.
+ADVISORY_CUES = [
+    r"\bnever\s+(?:ever\s+)?(?:asks?|calls?|sends?|requests?|seeks?|contacts?)\b",
+    r"\b(?:do\s+not|don'?t|never|not\s+to)\s+(?:share|disclose|reveal|click|open|download"
+    r"|install|respond|reply|entertain|fall\s+for)\b",
+    r"\bbeware\b",
+    r"\bbe\s+(?:alert|cautious|careful|aware|vigilant)\b",
+    r"\bstay\s+(?:safe|alert|vigilant|aware)\b",
+    r"\b1930\b",  # national cybercrime helpline
+    r"\bkabhi\s+(?:bhi\s+)?(?:nahi|nahin|nhi)\s+(?:maang|puch|pooch|mang)",
+    r"\b(?:share|click)\s+(?:na|mat|nahi|nhi)\s+kar",
+    r"\b(?:na|mat)\s+(?:karein|karen|karo)\s+share\b",
+    r"\b(?:savdhan|sawdhan|saavdhaan|savdhaan)\b",
+    r"कभी\s+(?:भी\s+)?नहीं\s+मा[ंँ]?ग",
+    r"(?:साझा|शेयर)\s+(?:न|ना|मत)\s+कर",
+    "सावधान",
+    "सतर्क",
+]
+# Asking for money: an advisory with any of these is not "just a warning".
+PAYMENT_REQUEST = [
+    r"\b(?:pay|transfer|deposit|send)\s+(?:rs\.?|inr|₹|(?:the|a)\s+(?:fee|amount|money)|fees"
+    r"|charges?|now|money|amount)\b",
+    r"\bpayment\s+(?:link|request)\b",
+    r"\bcollect\s+request\b",
+    r"\b(?:bhej|bhejo|bhejein|bhejiye|jama\s+kar)",
+    r"भुगतान\s+कर",
+    r"जमा\s+कर",
+    r"पैसे\s+भेज",
+]
+
+
+def advisory_evidence(entities: ExtractedEntities) -> str | None:
+    """The advisory cue, if the message is clearly a fraud-awareness notice: advisory
+    wording AND no link, UPI ID or upi:// link, phone number, amount or request for
+    money. None otherwise (including for a scam that borrows the wording and then asks
+    the reader to act)."""
+    if (entities.urls or entities.upi_ids or entities.upi_uris or entities.phones
+            or entities.amounts):  # fmt: skip
+        return None
+    texts = entities.rule_texts or [entities.normalized_text]
+    if any(_find(t, PAYMENT_REQUEST) for t in texts):
+        return None
+    return next((cue for t in texts if (cue := _find(t, ADVISORY_CUES))), None)

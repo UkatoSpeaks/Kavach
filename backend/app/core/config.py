@@ -137,6 +137,20 @@ class Settings(BaseSettings):
     # tonight") embeds close to anything. Chosen on tests/examples.py and UCI (ml/evaluate.py).
     PATTERN_MIN_WORDS: int = 12
 
+    # Trained scam classifier (ml/train_classifier.py): TF-IDF + logistic regression exported
+    # as JSON, run with numpy. A missing file only disables the "classifier" signal.
+    CLASSIFIER_ENABLED: bool = True
+    CLASSIFIER_MODEL_PATH: Path = BACKEND_DIR / "models" / "classifier.json"
+    # Below this calibrated P(scam) the signal is listed but not counted, so it can raise a
+    # score but never pull the rules' evidence down. The lowest value (on the validation
+    # split) at which all 36 built-in examples keep their verdicts: the model still rates some
+    # genuine Indian bank/delivery alerts 0.7-0.9 (see ml/reports/private/*_classifier.md).
+    CLASSIFIER_MIN_SCAM_PROBABILITY: float = 0.9
+    # The classifier's weight is multiplied by this on a fraud-awareness notice ("X never asks
+    # for your OTP", "report at 1930") with no link, UPI ID, phone number, amount or request
+    # for money (rules.advisory_evidence): such notices share scams' vocabulary.
+    CLASSIFIER_ADVISORY_WEIGHT_FACTOR: float = 0.5
+
     # Real-world checks. Safe Browsing is skipped when no key is set.
     SAFE_BROWSING_API_KEY: str = ""
     HTTP_TIMEOUT_S: float = 5.0
@@ -235,7 +249,7 @@ class Settings(BaseSettings):
     def _empty_is_none(cls, v: object) -> object:
         return None if isinstance(v, str) and not v.strip() else v
 
-    @field_validator("EMBEDDING_CACHE_DIR")
+    @field_validator("EMBEDDING_CACHE_DIR", "CLASSIFIER_MODEL_PATH")
     @classmethod
     def _relative_to_backend(cls, v: Path) -> Path:
         return v if v.is_absolute() else BACKEND_DIR / v

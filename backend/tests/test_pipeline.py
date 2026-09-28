@@ -125,7 +125,8 @@ def test_pure_analysis_makes_no_network_calls() -> None:
     with respx.mock as router:
         result = analyze_text(SCAM_EXAMPLES[9][1], get_settings()).result
     assert router.calls.call_count == 0
-    assert {s.source for s in result.signal_breakdown} == {"rules"}
+    # The classifier runs in-process (or is listed unavailable without a model file).
+    assert {s.source for s in result.signal_breakdown} == {"rules", "classifier"}
 
 
 # ----------------------------------------------------------------------------- scoring

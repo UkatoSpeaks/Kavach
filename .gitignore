@@ -21,6 +21,8 @@ backend/data/datasets/review_queue.csv
 backend/data/datasets/reviewed_labels.csv
 # AI-assisted labels to double-check (ml/apply_review.py).
 backend/data/datasets/review_low_confidence.csv
+# Messages where the rules and the classifier disagree (ml/disagreements.py).
+backend/data/datasets/review_disagreements.csv
 backend/data/datasets/processed/*
 !backend/data/datasets/processed/.gitkeep
 # Evaluation reports that quote your collected messages (ml/evaluate.py writes those to

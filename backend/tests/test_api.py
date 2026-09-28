@@ -63,8 +63,8 @@ async def test_analyze_scam_saves_and_reads_back(
     assert row.raw_input == text
     assert row.input_type == "text"
     assert set(row.latency_ms) == {
-        "extract", "rules", "pattern_similarity", "llm", "scoring", "explain", "total",
-        "node.extract", "node.run_checks", "node.reason", "node.finalize",
+        "extract", "rules", "pattern_similarity", "classifier", "llm", "scoring", "explain",
+        "total", "node.extract", "node.run_checks", "node.reason", "node.finalize",
     }  # fmt: skip
     assert row.extracted_entities["sensitive_info"] == ["upi_pin"]
 

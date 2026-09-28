@@ -7,6 +7,7 @@ LLM reasoning step between the checks and scoring. The steps themselves live her
 - `run_checks`: the network signals (url_intel, reputation, pattern_similarity) plus the
   UPI check, run concurrently with asyncio.gather. Every network signal has a timeout and
   fails soft: it shows up as "unavailable" in the breakdown and the rest still returns.
+  Then the trained classifier (`classifier_step`: in-process, a few ms, message text only).
 - `finish`: scoring + explanations (pure). Uses the LLM's narrative when there is one.
 
 `analyze_text` (pure, offline) and `analyze` (no LLM) compose them directly, for tests and
@@ -17,7 +18,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import httpx
@@ -26,7 +27,7 @@ from app.core.config import Settings
 from app.core.enums import EntityType, ScamType, Verdict
 from app.schemas.analysis import AnalysisResult, RedFlag
 from app.schemas.entities import ExtractedEntities
-from app.services import explain, rag, reputation, rules, scoring, upi, url_intel
+from app.services import classifier, explain, rag, reputation, rules, scoring, upi, url_intel
 from app.services.cache import LookupCache
 from app.services.extractors import extract_entities
 from app.services.scoring import SignalOutcome, severity_for
@@ -198,11 +199,46 @@ def extract_step(text: str, timer: Timer) -> tuple[ExtractedEntities, rules.Rule
     return entities, rule_result
 
 
+def classifier_step(
+    text: str,
+    entities: ExtractedEntities,
+    settings: Settings,
+    message_text: bool,
+    timer: Timer,
+) -> list[SignalOutcome]:
+    """The trained classifier's signal (pure, in-process, a few ms). Only for message text:
+    a bare URL/UPI ID/QR payload is nothing like what it was trained on. On a fraud-awareness
+    notice (rules.advisory_evidence) its weight is scaled down by
+    CLASSIFIER_ADVISORY_WEIGHT_FACTOR. Fails soft."""
+    if not message_text or not settings.CLASSIFIER_ENABLED:
+        return []
+    start = time.perf_counter()
+    try:
+        model = classifier.get_classifier(settings.CLASSIFIER_MODEL_PATH)
+        threshold = settings.CLASSIFIER_MIN_SCAM_PROBABILITY
+        outcome = classifier.classifier_signal(text, model, threshold)
+        factor = settings.CLASSIFIER_ADVISORY_WEIGHT_FACTOR
+        if outcome.score is not None and factor != 1 and (cue := rules.advisory_evidence(entities)):
+            outcome = replace(
+                outcome,
+                weight_factor=factor,
+                detail=f"{outcome.detail}; weight x{factor:g}: fraud-awareness wording "
+                f"({cue!r}) and no link, UPI ID, phone number or payment request",
+            )
+        return [outcome]
+    except Exception as exc:  # fail soft: the analysis goes on without this signal
+        logger.warning("signal classifier failed: %s: %s", type(exc).__name__, exc)
+        return [SignalOutcome(classifier.SOURCE, None, type(exc).__name__)]
+    finally:
+        timer.lap(classifier.SOURCE, start)
+
+
 def analyze_text(text: str, settings: Settings, language_hint: str | None = None) -> PipelineOutput:
-    """Pure, offline analysis: extractors, rules and UPI checks only."""
+    """Pure, offline analysis: extractors, rules, the classifier and UPI checks only."""
     timer = Timer()
     entities, rule_result = extract_step(text, timer)
     outcomes = [o for o in [upi.upi_signal(entities.upi_ids, entities.upi_uris)] if o]
+    outcomes += classifier_step(text, entities, settings, True, timer)
     return finish(entities, rule_result, outcomes, settings, language_hint, True, timer)
 
 
@@ -276,7 +312,8 @@ async def run_checks(
         if message_text:
             jobs.append(_timed(rag.SOURCE, lambda: _patterns(text, checks), timer, timeout))
 
-    return [o for o in await asyncio.gather(*jobs) if o is not None]
+    outcomes = [o for o in await asyncio.gather(*jobs) if o is not None]
+    return outcomes + classifier_step(text, entities, settings, message_text, timer)
 
 
 async def analyze(

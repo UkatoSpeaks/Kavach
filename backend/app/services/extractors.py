@@ -7,7 +7,8 @@ Every public function accepts raw text and cleans it itself (cleaning is idempot
 import re
 import unicodedata
 from collections.abc import Callable, Hashable
-from typing import TypeVar
+from dataclasses import dataclass
+from typing import Literal, TypeVar
 from urllib.parse import parse_qs, urlsplit
 
 from app.schemas.entities import (
@@ -214,8 +215,12 @@ def _missing_space(bare: str, raw: str) -> bool:
 
 
 def extract_urls(text: str) -> list[ExtractedURL]:
-    text = clean_text(text)
-    urls: list[ExtractedURL] = []
+    return _dedupe([u for _, u in _url_matches(clean_text(text))], key=lambda u: u.url)
+
+
+def _url_matches(text: str) -> list[tuple[tuple[int, int], ExtractedURL]]:
+    """Every URL in cleaned text with its span (trailing punctuation excluded)."""
+    urls: list[tuple[tuple[int, int], ExtractedURL]] = []
     for m in _URL_RE.finditer(text):
         scheme = m.group("scheme")
         host = (m.group("host") or m.group("bare")).lower()
@@ -228,18 +233,17 @@ def extract_urls(text: str) -> list[ExtractedURL]:
         rest = raw[len(scheme or "") + len(host) :]  # port + path, original case kept
         url = f"{(scheme or 'http://').lower()}{host}{rest}"
         domain = registered_domain(host)
-        urls.append(
-            ExtractedURL(
-                raw=raw,
-                url=url,
-                host=host,
-                registered_domain=domain,
-                is_shortener=domain in URL_SHORTENERS or host in URL_SHORTENERS,
-                is_ip=bool(_IPV4_RE.fullmatch(host)),
-                is_apk=urlsplit(url).path.lower().endswith(".apk"),
-            )
+        extracted = ExtractedURL(
+            raw=raw,
+            url=url,
+            host=host,
+            registered_domain=domain,
+            is_shortener=domain in URL_SHORTENERS or host in URL_SHORTENERS,
+            is_ip=bool(_IPV4_RE.fullmatch(host)),
+            is_apk=urlsplit(url).path.lower().endswith(".apk"),
         )
-    return _dedupe(urls, key=lambda u: u.url)
+        urls.append(((m.start(), m.start() + len(raw)), extracted))
+    return urls
 
 
 # --------------------------------------------------------------------------- UPI
@@ -523,6 +527,36 @@ def _protected_spans(cleaned: str) -> list[tuple[int, int]]:
         if m.group("pre") or m.group("post") or m.group("mult") or m.group("mult_l")
     ]
     return spans
+
+
+@dataclass(frozen=True)
+class EntitySpan:
+    start: int
+    end: int
+    kind: Literal["upi_uri", "url", "upi", "email", "phone", "amount"]
+    url: ExtractedURL | None = None  # for kind "url"
+
+
+def entity_spans(cleaned: str) -> list[EntitySpan]:
+    """Where the entities are in `cleaned` (output of clean_text), with the same filters as
+    the extract_* functions, sorted and non-overlapping: links win over the IDs, phones and
+    amounts inside them."""
+    found = [EntitySpan(*m.span(), "upi_uri") for m in _UPI_URI_RE.finditer(cleaned)]
+    found += [EntitySpan(*span, "url", url) for span, url in _url_matches(cleaned)]
+    found += [EntitySpan(*m.span(), kind) for m, kind in _at_matches(cleaned)]
+    for m in [*_MOBILE_RE.finditer(cleaned), *_TOLL_FREE_RE.finditer(cleaned)]:
+        if not _preceded_by_id_or_currency(cleaned, m.start()):
+            found.append(EntitySpan(*m.span(), "phone"))
+    for m in _AMOUNT_RE.finditer(cleaned):
+        mult = (m.group("mult") or m.group("mult_l") or "").lower()
+        if m.group("pre") or m.group("post") or mult in _STANDALONE_MULTIPLIERS:
+            start = m.start() + len(m.group(0)) - len(m.group(0).lstrip())
+            found.append(EntitySpan(start, m.start() + len(m.group(0).rstrip()), "amount"))
+    kept: list[EntitySpan] = []
+    for span in found:  # in priority order: the first claim on a character wins
+        if not any(span.start < k.end and k.start < span.end for k in kept):
+            kept.append(span)
+    return sorted(kept, key=lambda s: s.start)
 
 
 def extract_entities(text: str) -> ExtractedEntities:

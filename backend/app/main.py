@@ -20,6 +20,7 @@ from app.core.logging import RequestIDMiddleware, setup_logging
 from app.db.session import create_engine, create_sessionmaker
 from app.services.agent.graph import get_graph
 from app.services.agent.llm import GroqReasoner, LRUTTLCache
+from app.services.classifier import get_classifier
 from app.services.embeddings import FastEmbedder
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             settings.EMBEDDING_MODEL, settings.EMBEDDING_CACHE_DIR, settings.EMBEDDING_DIM
         )
         app.state.embedder.start_loading()
+    # Loaded now rather than on the first request (~6 MB of JSON). Missing: signal unavailable.
+    classifier_loaded = (
+        settings.CLASSIFIER_ENABLED and get_classifier(settings.CLASSIFIER_MODEL_PATH) is not None
+    )
     app.state.graph = get_graph()  # compiled once, shared by every request
     app.state.reasoner = (
         GroqReasoner(
@@ -61,6 +66,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "extra_fields": {
                 "env": settings.ENV,
                 "pattern_signal": settings.PATTERN_SIGNAL_ENABLED,
+                "classifier": classifier_loaded,
                 "llm": app.state.reasoner is not None,
             }
         },
