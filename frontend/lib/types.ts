@@ -33,7 +33,10 @@ export type SignalSource =
   | "upi_check"
   | "reputation"
   | "pattern_similarity"
-  | "llm";
+  | "llm"
+  /** Screenshots only. */
+  | "sender_check"
+  | "fake_payment_proof";
 
 // ---------------------------------------------------------------- AnalysisResult
 
@@ -100,6 +103,35 @@ export interface AnalysisResult {
   entities?: ReportableEntity[];
 }
 
+/** Which engine read a screenshot: Groq's vision model, or the local OCR fallback. */
+export type OcrEngine = "groq_vision" | "local" | "none";
+
+/** The app a screenshot came from, as the OCR guessed it. */
+export type ScreenshotApp = "sms" | "whatsapp" | "email" | "payment_app" | "other";
+
+/**
+ * POST /analyze/screenshot: the analysis plus what OCR read. The image is never stored, and
+ * GET /analysis/{id} returns only the AnalysisResult part.
+ */
+export interface ScreenshotAnalysisResult extends AnalysisResult {
+  /** The text OCR read; this (plus `qr_payload`) is what was analyzed. */
+  extracted_text: string;
+  ocr_engine: OcrEngine;
+  /** Sender name, number or SMS header, e.g. "+91 98765 43210" or "AX-HDFCBK". */
+  sender: string | null;
+  app: ScreenshotApp | null;
+  /** The image is a UPI/bank "payment successful" screen. */
+  is_payment_receipt: boolean;
+  /** A QR code found in the image, analyzed with the text. */
+  qr_payload: string | null;
+  /** Why an OCR engine was skipped or failed. */
+  ocr_notes: string[];
+}
+
+export function isScreenshotResult(r: AnalysisResult): r is ScreenshotAnalysisResult {
+  return typeof (r as Partial<ScreenshotAnalysisResult>).extracted_text === "string";
+}
+
 // ---------------------------------------------------------------- requests
 
 /** POST /analyze/text. `text`: 1-5000 characters, not blank. */
@@ -120,6 +152,11 @@ export type AnalyzeUpiRequest =
   | { upi_uri: string; upi_id?: never };
 
 /** POST /analyze/qr is multipart/form-data with one field, `image` (PNG or JPEG, max 5 MB). */
+
+/**
+ * POST /analyze/screenshot is multipart/form-data: `image` (PNG, JPEG or WEBP, max 5 MB) and
+ * optionally `language_hint`.
+ */
 
 /** Query string accepted by every /analyze/* route. false: skip the LLM step. */
 export interface AnalyzeQuery {
@@ -163,6 +200,10 @@ export type ApiErrorCode =
   | "image_too_large"
   | "unsupported_image"
   | "no_qr_code"
+  /** Screenshot: the image has no readable text (422). */
+  | "no_text_found"
+  /** Screenshot: no OCR engine could read it right now (503). */
+  | "ocr_unavailable"
   | (string & {});
 
 /** Every non-2xx response. 429s also carry a Retry-After header (seconds). */

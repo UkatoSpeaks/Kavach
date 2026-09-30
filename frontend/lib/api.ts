@@ -15,6 +15,7 @@ import type {
   ApiErrorBody,
   ReportRequest,
   ReportResponse,
+  ScreenshotAnalysisResult,
 } from "./types";
 
 export const API_URL = (
@@ -157,16 +158,24 @@ export function analyzeUpi(body: AnalyzeUpiRequest, options: AnalyzeOptions = {}
   return postJson<AnalysisResult>(withQuery("/analyze/upi", options), body, options);
 }
 
+function postImage<T>(path: string, image: Blob, fallbackName: string, options: AnalyzeOptions) {
+  const form = new FormData();
+  form.append("image", image, image instanceof File ? image.name : fallbackName);
+  // No Content-Type header: the browser sets the multipart boundary.
+  return request<T>(withQuery(path, options), { method: "POST", body: form }, options);
+}
+
 /** PNG or JPEG, max 5 MB. 422 `no_qr_code` when the image has no readable QR code. */
 export function analyzeQr(image: Blob, options: AnalyzeOptions = {}) {
-  const form = new FormData();
-  form.append("image", image, image instanceof File ? image.name : "qr.png");
-  // No Content-Type header: the browser sets the multipart boundary.
-  return request<AnalysisResult>(
-    withQuery("/analyze/qr", options),
-    { method: "POST", body: form },
-    options,
-  );
+  return postImage<AnalysisResult>("/analyze/qr", image, "qr.png", options);
+}
+
+/**
+ * PNG, JPEG or WEBP, max 5 MB. 422 `no_text_found` when there is no readable text; 503
+ * `ocr_unavailable` when the image reader is busy or down.
+ */
+export function analyzeScreenshot(image: Blob, options: AnalyzeOptions = {}) {
+  return postImage<ScreenshotAnalysisResult>("/analyze/screenshot", image, "screenshot.png", options);
 }
 
 /** A saved analysis. 404 if it doesn't exist (or its background save failed). */

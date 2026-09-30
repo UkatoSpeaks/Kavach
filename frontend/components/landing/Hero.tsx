@@ -25,8 +25,8 @@ export function Hero() {
           </h1>
 
           <p className="mt-6 max-w-xl text-lg text-ink-muted text-pretty sm:text-xl sm:leading-relaxed">
-            Paste any SMS, WhatsApp message, link, UPI ID or QR code. Kavach tells you in seconds if
-            it&apos;s a scam — and exactly why — in English and Hindi.
+            Paste any SMS, WhatsApp message, link, UPI ID or QR code — or just upload a screenshot.
+            Kavach tells you in seconds if it&apos;s a scam — and exactly why — in English and Hindi.
           </p>
 
           <div className="mt-8 flex flex-col gap-4 sm:flex-row">

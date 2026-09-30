@@ -247,9 +247,9 @@ async def analyze_upi_route(
     response_model=AnalysisResult,
     dependencies=[ANALYZE_LIMIT],
     responses={
-        413: {"description": "Image larger than 5 MB"},
-        415: {"description": "Not a PNG or JPEG image"},
-        422: {"description": "No QR code found in the image"},
+        413: {"description": "Image larger than 5 MB (code image_too_large)"},
+        415: {"description": "Not a PNG or JPEG image (code unsupported_image)"},
+        422: {"description": "No QR code found in the image (code no_qr_code)"},
     },
 )
 async def analyze_qr_route(
@@ -294,8 +294,9 @@ OCRReaderDep = Annotated[ScreenshotReader | None, Depends(get_ocr_reader)]
     dependencies=[ANALYZE_LIMIT],
     responses={
         413: {"description": "Image larger than 5 MB"},
-        422: {"description": "Not a PNG/JPEG/WEBP image, or no readable text in it"},
-        503: {"description": "No OCR engine could read the image (all unavailable)"},
+        415: {"description": "Not a PNG, JPEG or WEBP image (code unsupported_image)"},
+        422: {"description": "No readable text in the image (code no_text_found)"},
+        503: {"description": "No OCR engine could read the image (code ocr_unavailable)"},
     },
 )
 async def analyze_screenshot_route(
@@ -320,7 +321,7 @@ async def analyze_screenshot_route(
     except ocr.ImageTooLargeError as exc:
         raise ApiError(413, str(exc), code="image_too_large") from exc
     except ocr.UnsupportedImageError as exc:
-        raise ApiError(422, str(exc), code="unsupported_image") from exc
+        raise ApiError(415, str(exc), code="unsupported_image") from exc
     if reader is None:
         raise ApiError(503, "screenshot reading is not configured", code="ocr_unavailable")
 

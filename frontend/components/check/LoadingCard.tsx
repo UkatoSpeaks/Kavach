@@ -11,28 +11,38 @@ const STEPS = [
   "Writing the explanation…",
 ];
 
+/** Reading the image takes a few seconds on its own. */
+const SCREENSHOT_STEPS = [
+  "Reading your screenshot…",
+  "Checking the sender…",
+  ...STEPS.slice(1),
+];
+
 type LoadingCardProps = {
   /** True once the request has taken long enough that the server is probably waking up. */
   slow: boolean;
+  /** A screenshot is being read first. */
+  screenshot?: boolean;
 };
 
 /** Shown in the result column while a check runs. */
-export function LoadingCard({ slow }: LoadingCardProps) {
+export function LoadingCard({ slow, screenshot = false }: LoadingCardProps) {
+  const steps = screenshot ? SCREENSHOT_STEPS : STEPS;
   const [step, setStep] = useState(0);
 
   useEffect(() => {
-    const t = setInterval(() => setStep((s) => Math.min(s + 1, STEPS.length - 1)), 1400);
+    const t = setInterval(() => setStep((s) => Math.min(s + 1, steps.length - 1)), screenshot ? 2200 : 1400);
     return () => clearInterval(t);
-  }, []);
+  }, [steps.length, screenshot]);
 
   return (
     <Card className="p-5 sm:p-6">
       <p className="flex items-center gap-3 font-display text-2xl font-extrabold">
         <Loader2 aria-hidden className="size-6 animate-spin text-accent" />
-        Checking…
+        {screenshot && step === 0 ? "Reading your screenshot…" : "Checking…"}
       </p>
       <ol className="mt-4 flex flex-col gap-2" aria-hidden>
-        {STEPS.map((label, i) => (
+        {steps.map((label, i) => (
           <li
             key={label}
             className={i <= step ? "font-semibold text-ink" : "text-ink-muted/60"}

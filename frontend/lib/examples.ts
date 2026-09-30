@@ -70,3 +70,10 @@ export const QR_EXAMPLES: Example[] = [
   { label: "Cashback QR", value: "/examples/qr-scam.png" },
   { label: "Genuine: shop QR", value: "/examples/qr-shop.png", genuine: true },
 ];
+
+/** `value` is a file in public/ (rendered by backend/scripts/render_example_screenshots.py). */
+export const SCREENSHOT_EXAMPLES: Example[] = [
+  { label: "KYC SMS from a mobile number", value: "/examples/shot-sms-scam.png" },
+  { label: "Fake payment proof", value: "/examples/shot-payment-proof.png" },
+  { label: "Genuine: bank alert", value: "/examples/shot-bank-alert.png", genuine: true },
+];

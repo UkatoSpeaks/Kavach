@@ -1,16 +1,16 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { analyzeQr, analyzeText, analyzeUpi, analyzeUrl } from "@/lib/api";
+import { analyzeQr, analyzeScreenshot, analyzeText, analyzeUpi, analyzeUrl } from "@/lib/api";
 import { friendlyError, type FriendlyError } from "@/lib/errors";
 import type { Example } from "@/lib/examples";
 import { VERDICT_LABEL } from "@/lib/labels";
-import type { AnalysisResult } from "@/lib/types";
+import { isScreenshotResult, type AnalysisResult } from "@/lib/types";
 import { ResultPanel } from "@/components/result/ResultPanel";
 import type { CheckedSource } from "@/components/result/CheckedInput";
 import { EmptyState } from "./EmptyState";
 import { ErrorNotice } from "./ErrorNotice";
-import { InputPanel, type InputValues, type Tab } from "./InputPanel";
+import { InputPanel, isImageTab, type ImageTab, type InputValues, type Tab } from "./InputPanel";
 import { LoadingCard } from "./LoadingCard";
 
 /** After this long, the free server is probably waking up: say so. */
@@ -20,11 +20,11 @@ type Submission =
   | { kind: "text"; text: string }
   | { kind: "url"; url: string }
   | { kind: "upi"; value: string }
-  | { kind: "qr"; file: File; previewUrl: string };
+  | { kind: "qr" | "screenshot"; file: File; previewUrl: string };
 
 type Phase =
   | { state: "idle" }
-  | { state: "loading"; slow: boolean }
+  | { state: "loading"; slow: boolean; screenshot: boolean }
   | { state: "done"; result: AnalysisResult; source: CheckedSource }
   | { state: "error"; error: FriendlyError; attempt: number; retry: Submission };
 
@@ -40,10 +40,12 @@ function call(sub: Submission, signal: AbortSignal): Promise<AnalysisResult> {
     }
     case "qr":
       return analyzeQr(sub.file, { signal });
+    case "screenshot":
+      return analyzeScreenshot(sub.file, { signal });
   }
 }
 
-function sourceOf(sub: Submission): CheckedSource {
+function sourceOf(sub: Submission, result: AnalysisResult): CheckedSource {
   switch (sub.kind) {
     case "text":
       return { kind: "text", text: sub.text };
@@ -53,8 +55,24 @@ function sourceOf(sub: Submission): CheckedSource {
       return { kind: "upi", text: sub.value.trim() };
     case "qr":
       return { kind: "qr", imageUrl: sub.previewUrl };
+    case "screenshot":
+      return isScreenshotResult(result)
+        ? {
+            kind: "screenshot",
+            imageUrl: sub.previewUrl,
+            text: result.extracted_text,
+            sender: result.sender,
+            app: result.app,
+            isPaymentReceipt: result.is_payment_receipt,
+          }
+        : { kind: "qr", imageUrl: sub.previewUrl };
   }
 }
+
+const EMPTY_FIELD = {
+  qr: { qrFile: null, qrPreview: null },
+  screenshot: { shotFile: null, shotPreview: null },
+} as const;
 
 /** The /check page: input panel, then empty state, loading, error or result. */
 export function Checker() {
@@ -65,6 +83,8 @@ export function Checker() {
     upi: "",
     qrFile: null,
     qrPreview: null,
+    shotFile: null,
+    shotPreview: null,
   });
   const [phase, setPhase] = useState<Phase>({ state: "idle" });
   const [announcement, setAnnouncement] = useState("");
@@ -76,7 +96,7 @@ export function Checker() {
   const resultRef = useRef<HTMLDivElement>(null);
   const previews = useRef<Set<string>>(new Set());
 
-  // Object URLs for QR previews live until the page unmounts (a result may still show one).
+  // Object URLs for image previews live until the page unmounts (a result may still show one).
   useEffect(() => {
     const urls = previews.current;
     return () => {
@@ -89,10 +109,11 @@ export function Checker() {
     controller.current?.abort();
     const ctrl = new AbortController();
     controller.current = ctrl;
-    setPhase({ state: "loading", slow: false });
-    setAnnouncement("Checking…");
+    const screenshot = sub.kind === "screenshot";
+    setPhase({ state: "loading", slow: false, screenshot });
+    setAnnouncement(screenshot ? "Reading your screenshot…" : "Checking…");
     const slowTimer = setTimeout(() => {
-      setPhase((p) => (p.state === "loading" ? { state: "loading", slow: true } : p));
+      setPhase((p) => (p.state === "loading" ? { ...p, slow: true } : p));
       setAnnouncement("Waking up the server. This can take up to a minute.");
     }, SLOW_AFTER_MS);
     ctrl.signal.addEventListener("abort", () => clearTimeout(slowTimer));
@@ -100,7 +121,7 @@ export function Checker() {
     try {
       const result = await call(sub, ctrl.signal);
       if (ctrl.signal.aborted) return;
-      setPhase({ state: "done", result, source: sourceOf(sub) });
+      setPhase({ state: "done", result, source: sourceOf(sub, result) });
       setAnnouncement(
         `Result: ${VERDICT_LABEL[result.verdict]}, risk score ${result.risk_score} out of 100.`,
       );
@@ -133,16 +154,23 @@ export function Checker() {
         return v.qrFile && v.qrPreview
           ? { kind: "qr", file: v.qrFile, previewUrl: v.qrPreview }
           : null;
+      case "screenshot":
+        return v.shotFile && v.shotPreview
+          ? { kind: "screenshot", file: v.shotFile, previewUrl: v.shotPreview }
+          : null;
     }
   }
 
-  function setQrFile(file: File | null): InputValues {
+  function setImageFile(t: ImageTab, file: File | null): InputValues {
     let preview: string | null = null;
     if (file) {
       preview = URL.createObjectURL(file);
       previews.current.add(preview);
     }
-    const next = { ...values, qrFile: file, qrPreview: preview };
+    const next =
+      t === "qr"
+        ? { ...values, qrFile: file, qrPreview: preview }
+        : { ...values, shotFile: file, shotPreview: preview };
     setValues(next);
     return next;
   }
@@ -150,11 +178,11 @@ export function Checker() {
   async function pickExample(t: Tab, ex: Example) {
     setTab(t);
     let next: InputValues;
-    if (t === "qr") {
+    if (isImageTab(t)) {
       try {
         const blob = await (await fetch(ex.value)).blob();
         const name = ex.value.split("/").pop() ?? "example.png";
-        next = setQrFile(new File([blob], name, { type: blob.type || "image/png" }));
+        next = setImageFile(t, new File([blob], name, { type: blob.type || "image/png" }));
       } catch {
         return;
       }
@@ -172,10 +200,27 @@ export function Checker() {
     setAnnouncement("Check cancelled.");
   }
 
+  /** Check the (corrected) text read from a screenshot, as a message. */
+  function recheckText(text: string) {
+    setTab("text");
+    setValues((v) => ({ ...v, text }));
+    void run({ kind: "text", text });
+  }
+
+  function switchToMessageTab() {
+    setPhase({ state: "idle" });
+    setTab("text");
+    setAnnouncement("Switched to the Message tab. Paste the message text there.");
+    requestAnimationFrame(() => {
+      fieldRef.current?.focus();
+      fieldRef.current?.scrollIntoView({ block: "center" });
+    });
+  }
+
   function checkAnother() {
     controller.current?.abort();
     setPhase({ state: "idle" });
-    setValues((v) => ({ ...v, [tab === "qr" ? "qrFile" : tab]: tab === "qr" ? null : "" }));
+    setValues((v) => ({ ...v, ...(isImageTab(tab) ? EMPTY_FIELD[tab] : { [tab]: "" }) }));
     setAnnouncement("");
     requestAnimationFrame(() => {
       fieldRef.current?.focus();
@@ -186,14 +231,14 @@ export function Checker() {
   const loading = phase.state === "loading";
 
   return (
-    <div className="grid gap-8 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)] lg:items-start">
+    <div className="grid grid-cols-[minmax(0,1fr)] gap-8 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)] lg:items-start">
       <div className="lg:sticky lg:top-28">
         <InputPanel
           tab={tab}
           onTabChange={setTab}
           values={values}
           onValueChange={(t, v) => setValues((cur) => ({ ...cur, [t]: v }))}
-          onQrChange={setQrFile}
+          onImageChange={setImageFile}
           onSubmit={() => {
             const sub = submission(tab, values);
             if (sub) void run(sub);
@@ -210,12 +255,15 @@ export function Checker() {
           {announcement}
         </p>
         {phase.state === "idle" && <EmptyState onPick={(ex) => pickExample("text", ex)} />}
-        {phase.state === "loading" && <LoadingCard slow={phase.slow} />}
+        {phase.state === "loading" && (
+          <LoadingCard slow={phase.slow} screenshot={phase.screenshot} />
+        )}
         {phase.state === "error" && (
           <ErrorNotice
             key={phase.attempt}
             error={phase.error}
             onRetry={() => run(phase.retry)}
+            onUseMessageTab={phase.error.suggestMessageTab ? switchToMessageTab : undefined}
           />
         )}
         {phase.state === "done" && (
@@ -225,6 +273,7 @@ export function Checker() {
             source={phase.source}
             headingRef={headingRef}
             onCheckAnother={checkAnother}
+            onRecheckText={recheckText}
           />
         )}
       </div>

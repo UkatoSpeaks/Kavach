@@ -1,10 +1,11 @@
 "use client";
 
 import { useId, useMemo, useState, type KeyboardEvent } from "react";
-import { AlertTriangle, MousePointerClick } from "lucide-react";
+import { AlertTriangle, AppWindow, MousePointerClick, ReceiptIndianRupee, UserRound } from "lucide-react";
 import { highlightEvidence } from "@/lib/highlight";
 import type { Lang } from "@/lib/useExplanationLang";
-import type { RedFlag } from "@/lib/types";
+import { SCREENSHOT_APP_LABEL } from "@/lib/labels";
+import type { RedFlag, ScreenshotApp } from "@/lib/types";
 import { cn } from "@/lib/cn";
 import { SectionTitle } from "./SectionTitle";
 
@@ -12,6 +13,15 @@ import { SectionTitle } from "./SectionTitle";
 export type CheckedSource =
   | { kind: "text" | "url" | "upi"; text: string }
   | { kind: "qr"; imageUrl: string }
+  /** `text` is what OCR read from the image: the evidence is highlighted in it. */
+  | {
+      kind: "screenshot";
+      imageUrl: string;
+      text: string;
+      sender: string | null;
+      app: ScreenshotApp | null;
+      isPaymentReceipt: boolean;
+    }
   /** A shared result: the original input isn't available. */
   | { kind: "none" };
 
@@ -20,6 +30,7 @@ const TITLES = {
   url: "Your link",
   upi: "Your UPI ID",
   qr: "Your QR code",
+  screenshot: "Your screenshot",
   none: "Warning signs",
 };
 
@@ -38,7 +49,12 @@ function flagText(flag: RedFlag, lang: Lang): string {
  * highlight to see why; evidence that can't be located is listed underneath.
  */
 export function CheckedInput({ source, flags, lang }: CheckedInputProps) {
-  const text = source.kind === "text" || source.kind === "url" || source.kind === "upi" ? source.text : null;
+  const text =
+    source.kind === "text" || source.kind === "url" || source.kind === "upi"
+      ? source.text
+      : source.kind === "screenshot" && source.text.trim()
+        ? source.text
+        : null;
   const { segments, unlocated } = useMemo(
     () =>
       text !== null
@@ -74,12 +90,24 @@ export function CheckedInput({ source, flags, lang }: CheckedInputProps) {
         />
       )}
 
+      {source.kind === "screenshot" && (
+        <div className="mt-3 flex items-start gap-4">
+          {/* eslint-disable-next-line @next/next/no-img-element -- a local blob: URL */}
+          <img
+            src={source.imageUrl}
+            alt="The screenshot you checked"
+            className="h-36 w-20 shrink-0 rounded-xl border-2 border-ink bg-card object-cover object-top"
+          />
+          <ScreenshotChips source={source} />
+        </div>
+      )}
+
       {text !== null && (
         <>
           <p
             className={cn(
-              "mt-3 rounded-xl border-2 border-ink bg-paper px-4 py-3 break-words whitespace-pre-wrap",
-              source.kind !== "text" && "font-mono text-sm",
+              "mt-3 rounded-xl border-2 border-ink bg-paper px-4 py-3 whitespace-pre-wrap [overflow-wrap:anywhere]",
+              (source.kind === "url" || source.kind === "upi") && "font-mono text-sm",
             )}
           >
             {segments.map((seg, i) =>
@@ -162,9 +190,53 @@ export function CheckedInput({ source, flags, lang }: CheckedInputProps) {
         </div>
       )}
 
+      {source.kind === "screenshot" && text === null && (
+        <p className="mt-3 text-sm text-ink-muted">No message text in the screenshot.</p>
+      )}
+
       {flags.length === 0 && text !== null && (
         <p className="mt-2 text-sm text-ink-muted">No warning signs found in the text.</p>
       )}
     </section>
+  );
+}
+
+type ScreenshotSource = Extract<CheckedSource, { kind: "screenshot" }>;
+
+const chipClass =
+  "inline-flex max-w-full items-center gap-1.5 rounded-full border-2 border-ink bg-card px-3 py-1 text-sm font-semibold";
+
+/** What OCR noticed besides the text: the app, the sender and a payment receipt. */
+function ScreenshotChips({ source }: { source: ScreenshotSource }) {
+  const app = source.app && source.app !== "other" ? SCREENSHOT_APP_LABEL[source.app] : null;
+  if (!app && !source.sender && !source.isPaymentReceipt) {
+    return <p className="text-sm text-ink-muted">We read the text in your screenshot below.</p>;
+  }
+  return (
+    <div className="min-w-0">
+      <p className="text-sm font-bold text-ink-muted">What we noticed</p>
+      <ul className="mt-2 flex flex-wrap gap-2">
+        {app && (
+          <li className={chipClass}>
+            <AppWindow aria-hidden className="size-4 shrink-0 text-accent" />
+            {app}
+          </li>
+        )}
+        {source.sender && (
+          <li className={chipClass}>
+            <UserRound aria-hidden className="size-4 shrink-0 text-accent" />
+            <span className="min-w-0 [overflow-wrap:anywhere]">
+              From: <span className="font-mono">{source.sender}</span>
+            </span>
+          </li>
+        )}
+        {source.isPaymentReceipt && (
+          <li className={chipClass}>
+            <ReceiptIndianRupee aria-hidden className="size-4 shrink-0 text-accent" />
+            Looks like a payment receipt
+          </li>
+        )}
+      </ul>
+    </div>
   );
 }

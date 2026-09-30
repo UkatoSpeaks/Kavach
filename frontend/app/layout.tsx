@@ -25,7 +25,7 @@ const devanagari = Noto_Sans_Devanagari({
 
 const title = "Kavach — Check a message before you pay";
 const description =
-  "Paste any SMS, WhatsApp message, link, UPI ID or QR code. Kavach tells you in seconds if it's a scam — and exactly why — in English and Hindi.";
+  "Paste any SMS, WhatsApp message, link, UPI ID, QR code or screenshot. Kavach tells you in seconds if it's a scam — and exactly why — in English and Hindi.";
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),

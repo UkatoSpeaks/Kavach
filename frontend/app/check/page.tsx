@@ -7,7 +7,7 @@ import { WarmUp } from "@/components/site/WarmUp";
 
 export const metadata: Metadata = {
   title: "Check a message",
-  description: "Check an SMS, WhatsApp message, link, UPI ID or QR code for scams.",
+  description: "Check an SMS, WhatsApp message, link, UPI ID, QR code or screenshot for scams.",
   alternates: { canonical: "/check" },
 };
 
@@ -23,8 +23,8 @@ export default function CheckPage() {
               Check before you pay
             </h1>
             <p className="mt-2 text-lg text-ink-muted text-pretty">
-              Paste a message, link or UPI ID, or upload a QR code. You&apos;ll see if it&apos;s a
-              scam — and exactly why.
+              Paste a message, link or UPI ID, or upload a QR code or screenshot. You&apos;ll see
+              if it&apos;s a scam — and exactly why.
             </p>
           </div>
           <div className="mt-8">

@@ -61,7 +61,7 @@ export default function OpengraphImage() {
           phir pay karo.
         </div>
         <div style={{ marginTop: 40, fontSize: 34, color: "#3f3f46" }}>
-          AI scam checker for SMS, links, UPI IDs and QR codes — in English and Hindi.
+          AI scam checker for SMS, links, UPI IDs, QR codes and screenshots — in English and Hindi.
         </div>
       </div>
     ),

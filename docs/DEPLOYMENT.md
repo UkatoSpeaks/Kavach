@@ -22,8 +22,10 @@ Set `ENV=prod` (or `ENV=production`). Every setting is listed in `backend/.env.e
   Behind Render's proxy the client IP is taken from `X-Forwarded-For` (`TRUSTED_PROXY_HOPS=2`).
   The app never uses the leftmost entry, because a client can forge it.
 - **Limits:** text up to 5000 characters (422), JSON bodies up to 64 KB (413), images up to
-  5 MB (413). `/analyze/screenshot` takes PNG, JPEG or WEBP; anything else is a 422
-  (`unsupported_image`), and so is an image with no readable text (`no_text_found`).
+  5 MB (413, `image_too_large`). `/analyze/qr` takes PNG or JPEG and `/analyze/screenshot`
+  PNG, JPEG or WEBP; anything else is a 415 (`unsupported_image`). A screenshot with no
+  readable text is a 422 (`no_text_found`), and one no OCR engine could read right now is a
+  503 (`ocr_unavailable`).
 - **Errors** always come back as `{"error": {"code": "...", "message": "..."}}`. Validation
   errors (422) also include `details: [{field, message}]`. In prod, a 500 says only
   "Internal server error". The full traceback goes to the logs.

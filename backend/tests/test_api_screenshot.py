@@ -197,8 +197,8 @@ async def test_language_hint_hi(make_client: ClientFactory) -> None:
 @pytest.mark.parametrize(
     ("content", "status", "code"),
     [
-        (b"just text", 422, "unsupported_image"),
-        (to_bytes(Image.new("RGB", (20, 20)), "GIF"), 422, "unsupported_image"),
+        (b"just text", 415, "unsupported_image"),
+        (to_bytes(Image.new("RGB", (20, 20)), "GIF"), 415, "unsupported_image"),
         (b"\x89PNG" + b"0" * MAX_IMAGE_BYTES, 413, "image_too_large"),
     ],
     ids=["not-an-image", "gif", "too-large"],
@@ -231,7 +231,9 @@ async def test_no_ocr_engine_available(make_client: ClientFactory) -> None:
     assert resp.json()["error"]["code"] == "ocr_unavailable"
 
     async with make_client(ocr=None) as c:
-        assert (await post(c, upload(render_sms("x", PHISHING)))).status_code == 503
+        resp = await post(c, upload(render_sms("x", PHISHING)))
+    assert resp.status_code == 503
+    assert resp.json()["error"]["code"] == "ocr_unavailable"
 
 
 async def test_requires_a_file(make_client: ClientFactory) -> None:

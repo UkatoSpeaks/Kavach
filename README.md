@@ -1,6 +1,6 @@
 # Kavach 🛡️
 
-**AI scam detector for India — paste any SMS, link, UPI ID or QR code and get an explainable verdict in English and हिंदी.**
+**AI scam detector for India — paste any SMS, link, UPI ID, QR code or screenshot and get an explainable verdict in English and हिंदी.**
 
 [![CI](https://github.com/UkatoSpeaks/Kavach/actions/workflows/ci.yml/badge.svg)](https://github.com/UkatoSpeaks/Kavach/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)
@@ -17,6 +17,7 @@
 
 - **Fraud, not spam.** Three classes — genuine, promotion, scam. A loud sale SMS is annoying but safe; a polite "KYC update" link is not.
 - **Checks real-world evidence.** Domain age (RDAP), short-link expansion, lookalike and brand-impersonating UPI IDs, decoded QR payloads (`upi://` collect vs pay), and community reports.
+- **Reads screenshots.** Upload, drop or paste a screenshot: a vision model reads the text, the sender is checked (a bank's `AX-HDFCBK` header vs a personal mobile number), fake "payment successful" proofs are caught, and any QR code in it is decoded. The image is discarded; you can fix the read text and re-check it.
 - **Explainable scoring.** Every signal's contribution is shown, and the evidence is highlighted in the original message.
 - **Adversarially robust.** Handles leetspeak (`N0W`, `amaz0n`), zero-width and invisible characters, lookalike domains, and prompt injection aimed at the LLM.
 - **Honest evaluation.** Metrics on held-out real Indian scams, with confidence intervals and a written list of caveats.
@@ -29,7 +30,7 @@ flowchart LR
     FE -->|HTTPS| API["FastAPI<br/>(Render)"]
 
     subgraph API_PIPE ["Analysis pipeline"]
-        IN["Input<br/>text / link / UPI / QR"] --> NX["Normalize & extract<br/>URLs, UPI IDs, phones, amounts"]
+        IN["Input<br/>text / link / UPI / QR / screenshot"] --> NX["Normalize & extract<br/>URLs, UPI IDs, phones, amounts"]
         NX --> CHECKS
         subgraph CHECKS ["Parallel checks"]
             R["Rules"]
@@ -133,8 +134,9 @@ Full setup, tests and lint: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). Deployin
 
 **Roadmap**
 
-- WhatsApp bot — forward a message, get a verdict
-- Screenshot upload in the web app. The API side is done: `POST /analyze/screenshot` reads the image with a Groq vision model (a local RapidOCR fallback where memory allows), checks the sender (bank header vs personal number) and fake "payment successful" proofs, and decodes any QR code in it. Next: better local Hindi OCR.
+- ✅ Screenshots — upload or paste one in the web app (`POST /analyze/screenshot`: Groq vision OCR with a local RapidOCR fallback where memory allows, sender and fake-payment-proof checks, QR decoding)
+- WhatsApp bot — forward a message, get a verdict (coming next)
+- Better local Hindi (Devanagari) OCR for when the vision model is busy
 - Compare against a fine-tuned MuRIL transformer
 - More real Indian data, especially UPI collect-request and QR scams
 

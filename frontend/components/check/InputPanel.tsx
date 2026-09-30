@@ -1,11 +1,21 @@
 "use client";
 
 import { useId, useRef, type FormEvent, type KeyboardEvent, type RefObject } from "react";
-import { Link2, MessageSquareText, QrCode, ScanSearch, IndianRupee, X } from "lucide-react";
+import {
+  IndianRupee,
+  Link2,
+  LockKeyhole,
+  MessageSquareText,
+  QrCode,
+  ScanSearch,
+  Smartphone,
+  X,
+} from "lucide-react";
 import {
   LINK_EXAMPLES,
   MESSAGE_EXAMPLES,
   QR_EXAMPLES,
+  SCREENSHOT_EXAMPLES,
   UPI_EXAMPLES,
   type Example,
 } from "@/lib/examples";
@@ -13,17 +23,26 @@ import { cn } from "@/lib/cn";
 import { Button } from "@/components/ui/Button";
 import { Card } from "@/components/ui/Card";
 import { ExampleChips } from "./ExampleChips";
+import { ImageField } from "./ImageField";
 import { LineField, linkHint, upiHint } from "./LineField";
 import { MessageField } from "./MessageField";
-import { QrField } from "./QrField";
 
-export type Tab = "text" | "url" | "upi" | "qr";
+export type Tab = "text" | "url" | "upi" | "qr" | "screenshot";
+
+/** Tabs whose input is an image file. */
+export type ImageTab = Extract<Tab, "qr" | "screenshot">;
+
+export function isImageTab(tab: Tab): tab is ImageTab {
+  return tab === "qr" || tab === "screenshot";
+}
 
 export const TABS: { id: Tab; label: string; Icon: typeof Link2; examples: Example[] }[] = [
   { id: "text", label: "Message", Icon: MessageSquareText, examples: MESSAGE_EXAMPLES },
   { id: "url", label: "Link", Icon: Link2, examples: LINK_EXAMPLES },
   { id: "upi", label: "UPI ID", Icon: IndianRupee, examples: UPI_EXAMPLES },
   { id: "qr", label: "QR code", Icon: QrCode, examples: QR_EXAMPLES },
+  // Soft hyphen: on a 375px phone five tabs leave no room for "Screenshot" on one line.
+  { id: "screenshot", label: "Screen­shot", Icon: Smartphone, examples: SCREENSHOT_EXAMPLES },
 ];
 
 export type InputValues = {
@@ -32,14 +51,16 @@ export type InputValues = {
   upi: string;
   qrFile: File | null;
   qrPreview: string | null;
+  shotFile: File | null;
+  shotPreview: string | null;
 };
 
 type InputPanelProps = {
   tab: Tab;
   onTabChange: (tab: Tab) => void;
   values: InputValues;
-  onValueChange: (tab: Exclude<Tab, "qr">, value: string) => void;
-  onQrChange: (file: File | null) => void;
+  onValueChange: (tab: Exclude<Tab, ImageTab>, value: string) => void;
+  onImageChange: (tab: ImageTab, file: File | null) => void;
   onSubmit: () => void;
   onCancel: () => void;
   onExample: (tab: Tab, example: Example) => void;
@@ -57,16 +78,18 @@ export function isReady(tab: Tab, values: InputValues): boolean {
       return values.upi.trim().length > 0;
     case "qr":
       return values.qrFile !== null;
+    case "screenshot":
+      return values.shotFile !== null;
   }
 }
 
-/** The four input tabs, the submit button and the scanning overlay. */
+/** The input tabs, the submit button and the scanning overlay. */
 export function InputPanel({
   tab,
   onTabChange,
   values,
   onValueChange,
-  onQrChange,
+  onImageChange,
   onSubmit,
   onCancel,
   onExample,
@@ -109,7 +132,7 @@ export function InputPanel({
       <div
         role="tablist"
         aria-label="What do you want to check?"
-        className="grid grid-cols-4 border-b-2 border-ink bg-paper"
+        className="grid grid-cols-5 border-b-2 border-ink bg-paper"
       >
         {TABS.map((t, i) => {
           const selected = t.id === tab;
@@ -129,7 +152,7 @@ export function InputPanel({
               onClick={() => onTabChange(t.id)}
               onKeyDown={(e) => onTabKey(e, i)}
               className={cn(
-                "flex min-h-16 flex-col items-center justify-center gap-1 px-1 py-2 text-sm leading-tight font-bold transition-colors",
+                "flex min-h-16 min-w-0 flex-col items-center justify-center gap-1 px-0.5 py-2 text-center text-[13px] leading-tight font-bold hyphens-manual transition-colors sm:px-1 sm:text-sm",
                 "border-ink not-last:border-r-2 focus-visible:-outline-offset-4",
                 selected ? "bg-card text-accent-dark shadow-[inset_0_-4px_0_var(--color-accent)]" : "text-ink-muted hover:bg-accent-tint hover:text-ink",
                 "disabled:opacity-50",
@@ -186,11 +209,33 @@ export function InputPanel({
             />
           )}
           {tab === "qr" && (
-            <QrField
+            <ImageField
+              kind="qr"
+              label="Upload a photo or screenshot of the QR code"
+              previewAlt="Preview of the chosen QR code image"
               file={values.qrFile}
               previewUrl={values.qrPreview}
-              onChange={onQrChange}
+              onChange={(f) => onImageChange("qr", f)}
               disabled={loading}
+            />
+          )}
+          {tab === "screenshot" && (
+            <ImageField
+              kind="screenshot"
+              label="Upload a screenshot of the message or chat"
+              previewAlt="Preview of the chosen screenshot"
+              file={values.shotFile}
+              previewUrl={values.shotPreview}
+              onChange={(f) => onImageChange("screenshot", f)}
+              disabled={loading}
+              pasteable
+              previewClassName="h-40 w-24"
+              note={
+                <p className="mt-3 flex items-start gap-2 text-sm text-ink-muted">
+                  <LockKeyhole aria-hidden className="mt-0.5 size-4 shrink-0 text-accent" />
+                  Your screenshot is read and then discarded — only the text is kept.
+                </p>
+              }
             />
           )}
 

@@ -32,8 +32,7 @@ const ITEMS: Item[] = [
   {
     icon: ImageIcon,
     title: "Screenshots",
-    body: "Share a screenshot of a chat or SMS and get the same check.",
-    soon: true,
+    body: "Upload or paste a screenshot of an SMS or chat. We read the text, check who sent it and spot fake payment proofs.",
   },
   {
     icon: MessageCircle,
@@ -51,7 +50,7 @@ export function WhatWeCheck() {
           id="checks-title"
           eyebrow="What Kavach checks"
           title="Anything a scammer sends you"
-          intro="Copy it, paste it, and get a clear answer before you reply, click or pay."
+          intro="Paste it or upload a screenshot, and get a clear answer before you reply, click or pay."
         />
         <ul className="mt-10 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
           {ITEMS.map(({ icon: Icon, title, body, soon }) => (

@@ -1,4 +1,4 @@
-import { Link2, MessageSquareText, ScanLine, ShieldCheck } from "lucide-react";
+import { Link2, MessageSquareText, ScanLine, ShieldCheck, Smartphone } from "lucide-react";
 import type { Example } from "@/lib/examples";
 import { MESSAGE_EXAMPLES } from "@/lib/examples";
 import { Card } from "@/components/ui/Card";
@@ -8,6 +8,7 @@ const TIPS = [
   { Icon: MessageSquareText, text: "Paste the full message, including links and numbers." },
   { Icon: Link2, text: "Got just a link or UPI ID? Use the Link or UPI ID tab." },
   { Icon: ScanLine, text: "Asked to scan a QR code? Upload a photo or screenshot of it." },
+  { Icon: Smartphone, text: "Easier to screenshot than copy? Use the Screenshot tab." },
 ];
 
 /** The result column before any check: short guidance and examples, not a blank box. */

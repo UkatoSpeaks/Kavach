@@ -11,10 +11,12 @@ import { SectionTitle } from "./SectionTitle";
 type SignalBreakdownProps = {
   signals: Signal[];
   flags: RedFlag[];
+  /** Small print under the list, e.g. which engine read a screenshot. */
+  note?: string;
 };
 
 /** "How we decided": each check's score and weight as a labelled bar. */
-export function SignalBreakdown({ signals, flags }: SignalBreakdownProps) {
+export function SignalBreakdown({ signals, flags, note }: SignalBreakdownProps) {
   const id = useId();
   const reduced = usePrefersReducedMotion();
   if (signals.length === 0) return null;
@@ -78,6 +80,7 @@ export function SignalBreakdown({ signals, flags }: SignalBreakdownProps) {
           );
         })}
       </ul>
+      {note && <p className="mt-4 text-xs text-ink-muted">{note}</p>}
     </section>
   );
 }
