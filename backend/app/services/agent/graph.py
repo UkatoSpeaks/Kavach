@@ -1,6 +1,6 @@
 """The analysis agent: a LangGraph StateGraph over the pipeline steps.
 
-    extract -> run_checks -> reason (LLM) -> finalize
+    extract -> run_checks (+ screenshot signals) -> reason (LLM) -> finalize
                          \\-------------------^   (?explain=false skips the LLM)
 
 The graph is compiled once per process (get_graph) and shared; per-request dependencies
@@ -20,6 +20,7 @@ from app.services.agent import nodes
 from app.services.agent.llm import Reasoner
 from app.services.agent.state import AnalysisContext, AnalysisState
 from app.services.pipeline import Checks, PipelineOutput
+from app.services.screenshot import ScreenshotContext
 
 AnalysisGraph = CompiledStateGraph[AnalysisState, AnalysisContext, Any, Any]
 
@@ -58,6 +59,7 @@ async def run_analysis(
     message_text: bool = True,
     explain: bool = True,
     graph: AnalysisGraph | None = None,
+    screenshot: ScreenshotContext | None = None,
 ) -> PipelineOutput:
     start = time.perf_counter()
     state = await (graph or get_graph()).ainvoke(
@@ -66,6 +68,7 @@ async def run_analysis(
             "message_text": message_text,
             "language_hint": language_hint,
             "explain": explain,
+            "screenshot": screenshot,
             "latency_ms": {},
         },
         context=AnalysisContext(settings=settings, checks=checks, reasoner=reasoner),

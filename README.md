@@ -134,7 +134,7 @@ Full setup, tests and lint: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). Deployin
 **Roadmap**
 
 - WhatsApp bot — forward a message, get a verdict
-- Screenshot OCR
+- Screenshot upload in the web app. The API side is done: `POST /analyze/screenshot` reads the image with a Groq vision model (a local RapidOCR fallback where memory allows), checks the sender (bank header vs personal number) and fake "payment successful" proofs, and decodes any QR code in it. Next: better local Hindi OCR.
 - Compare against a fine-tuned MuRIL transformer
 - More real Indian data, especially UPI collect-request and QR scams
 

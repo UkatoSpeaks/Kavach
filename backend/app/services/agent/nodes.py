@@ -40,6 +40,14 @@ async def run_checks(state: AnalysisState, runtime: Runtime[AnalysisContext]) ->
     outcomes = await pipeline.run_checks(
         state["text"], state["entities"], ctx.settings, ctx.checks, state["message_text"], timer
     )
+    outcomes += pipeline.screenshot_step(
+        state.get("screenshot"),
+        state["entities"],
+        state["rule_result"],
+        outcomes,
+        ctx.settings,
+        timer,
+    )
     return {"outcomes": outcomes, "latency_ms": {**timer.latency, "node.run_checks": _ms(start)}}
 
 

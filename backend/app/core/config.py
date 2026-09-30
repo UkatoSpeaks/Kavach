@@ -151,6 +151,22 @@ class Settings(BaseSettings):
     # for money (rules.advisory_evidence): such notices share scams' vocabulary.
     CLASSIFIER_ADVISORY_WEIGHT_FACTOR: float = 0.5
 
+    # Screenshots (app/services/ocr.py). Groq vision model first (needs GROQ_API_KEY; empty:
+    # skipped), then the local OCR. qwen/qwen3.8-27b is the only vision-capable model on the
+    # free tier as of 2026-09; an image costs ~1.3-1.8k of the 8k tokens/minute.
+    GROQ_VISION_MODEL: str = "qwen/qwen3.8-27b"
+    VISION_TIMEOUT_S: float = 15.0
+    # Local fallback: RapidOCR (onnxruntime, no torch), loaded on first use. Adds ~110 MB RSS
+    # once loaded and peaks ~305 MB above the app while reading an image (docs/DEPLOYMENT.md),
+    # so it is off on Render's 512 MB free instance.
+    LOCAL_OCR_ENABLED: bool = True
+    # Adds a Devanagari recognizer (~8 MB download into LOCAL_OCR_CACHE_DIR, ~20 MB RSS). The
+    # bundled models read Latin script only.
+    LOCAL_OCR_DEVANAGARI: bool = True
+    LOCAL_OCR_CACHE_DIR: Path = BACKEND_DIR / ".cache" / "rapidocr"
+    # Long side the local OCR reads at: its memory peak grows with the pixel count.
+    LOCAL_OCR_MAX_SIDE: int = 1024
+
     # Real-world checks. Safe Browsing is skipped when no key is set.
     SAFE_BROWSING_API_KEY: str = ""
     HTTP_TIMEOUT_S: float = 5.0
@@ -167,6 +183,9 @@ class Settings(BaseSettings):
         "reputation": 0.10,
         "pattern_similarity": 0.05,
         "llm": 0.15,
+        # Screenshots only (app/services/screenshot.py).
+        "sender_check": 0.15,
+        "fake_payment_proof": 0.15,
     }
     # risk_score < SUSPICIOUS_MIN -> safe; < SCAM_MIN -> suspicious; else scam.
     VERDICT_SUSPICIOUS_MIN: int = 35
@@ -214,6 +233,7 @@ class Settings(BaseSettings):
         "GROQ_BASE_URL",
         "GROQ_MODEL",
         "GROQ_FALLBACK_MODEL",
+        "GROQ_VISION_MODEL",
         "SAFE_BROWSING_API_KEY",
         mode="before",
     )
@@ -249,7 +269,7 @@ class Settings(BaseSettings):
     def _empty_is_none(cls, v: object) -> object:
         return None if isinstance(v, str) and not v.strip() else v
 
-    @field_validator("EMBEDDING_CACHE_DIR", "CLASSIFIER_MODEL_PATH")
+    @field_validator("EMBEDDING_CACHE_DIR", "CLASSIFIER_MODEL_PATH", "LOCAL_OCR_CACHE_DIR")
     @classmethod
     def _relative_to_backend(cls, v: Path) -> Path:
         return v if v.is_absolute() else BACKEND_DIR / v

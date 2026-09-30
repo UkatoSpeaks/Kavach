@@ -63,9 +63,18 @@ def decode_qr(data: bytes) -> QRPayload:
     except (UnidentifiedImageError, Image.DecompressionBombError, OSError) as exc:
         raise UnsupportedImageError("not a readable PNG or JPEG image") from exc
 
+    found = find_qr(gray)
+    if found is None:
+        raise NoQRCodeError("no QR code found in the image")
+    return found
+
+
+def find_qr(img: Image.Image) -> QRPayload | None:
+    """First QR code in an already opened image, or None (screenshots: a QR is optional)."""
+    gray = img if img.mode == "L" else img.convert("L")
     results = zxingcpp.read_barcodes(gray, formats=zxingcpp.BarcodeFormat.QRCode)
     payload = next((r.text for r in results if r.text and r.text.strip()), None)
     if payload is None:
-        raise NoQRCodeError("no QR code found in the image")
+        return None
     payload = payload.strip()
     return QRPayload(payload=payload, kind=classify(payload))

@@ -9,6 +9,7 @@ from app.services.agent.llm import Reasoner
 from app.services.pipeline import Checks, Narrative, PipelineOutput
 from app.services.rules import RuleResult
 from app.services.scoring import SignalOutcome
+from app.services.screenshot import ScreenshotContext
 
 
 def merge_latency(left: dict[str, float], right: dict[str, float]) -> dict[str, float]:
@@ -22,6 +23,7 @@ class AnalysisState(TypedDict, total=False):
     message_text: bool  # False for bare URL/UPI/QR payloads
     language_hint: str | None
     explain: bool  # False: skip the LLM step entirely (?explain=false)
+    screenshot: ScreenshotContext | None  # sender etc. seen by OCR; None for other inputs
     # extract
     entities: ExtractedEntities
     rule_result: RuleResult

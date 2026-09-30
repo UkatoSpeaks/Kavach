@@ -8,6 +8,12 @@ code that runs on every request (extractors, rules, classifier, scoring, templat
     uv run python -m scripts.measure_memory                      # classifier on
     uv run python -m scripts.measure_memory --no-classifier
     uv run python -m scripts.measure_memory --model path/to/other.json
+    uv run python -m scripts.measure_memory --screenshots          # local OCR (no Groq)
+    uv run python -m scripts.measure_memory --screenshots --no-devanagari
+
+--screenshots posts generated phone screenshots (tests/screenshots.py) to
+/analyze/screenshot with the vision model off, so every one goes through the local OCR,
+which loads on the first request. Needs the dev dependencies (qrcode).
 
 Run each configuration in a fresh process: memory a process has touched is rarely returned.
 RSS here is the working set on Windows and VmRSS on Linux.
@@ -75,7 +81,9 @@ async def run(args: argparse.Namespace) -> None:
     from tests.fakes import FakeSession, session_factory
 
     update = {"PATTERN_SIGNAL_ENABLED": False, "CLASSIFIER_ENABLED": not args.no_classifier,
-              "RATE_LIMIT_ENABLED": False}  # fmt: skip
+              "RATE_LIMIT_ENABLED": False, "GROQ_VISION_MODEL": "",
+              "LOCAL_OCR_ENABLED": args.screenshots,
+              "LOCAL_OCR_DEVANAGARI": not args.no_devanagari}  # fmt: skip
     if args.model:
         update["CLASSIFIER_MODEL_PATH"] = args.model
     settings = get_settings().model_copy(update=update)
@@ -100,17 +108,33 @@ async def run(args: argparse.Namespace) -> None:
         gc.collect()
         started = rss_mb()
         transport = httpx.ASGITransport(app=app)
+        images = screenshots() if args.screenshots else []
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as http:
             for i in range(args.n):
-                resp = await http.post("/analyze/text?explain=false",
-                                       json={"text": TEXTS[i % len(TEXTS)]})  # fmt: skip
+                if args.screenshots:
+                    files = {"image": ("s.png", images[i % len(images)], "image/png")}
+                    resp = await http.post("/analyze/screenshot?explain=false", files=files)
+                else:
+                    resp = await http.post("/analyze/text?explain=false",
+                                           json={"text": TEXTS[i % len(TEXTS)]})  # fmt: skip
                 resp.raise_for_status()
         gc.collect()
         after = rss_mb()
     label = "classifier OFF" if args.no_classifier else "classifier ON"
+    if args.screenshots:
+        label += ", local OCR" + ("" if args.no_devanagari else " + Devanagari")
     print(f"{label}: python+imports {base:.0f} MB -> after startup {started:.0f} MB -> "
           f"after {args.n} analyses {after:.0f} MB"
           + (f" (peak {rss_mb(peak=True):.0f} MB)" if sys.platform == "win32" else ""))  # fmt: skip
+
+
+def screenshots() -> list[bytes]:
+    """Phone-sized PNGs (1080 px wide), English and Hindi."""
+    from tests.screenshots import render_sms, to_bytes
+
+    return [to_bytes(render_sms(f"+91 98{i:03d} 43210", text)) for i, text in enumerate(TEXTS)] + [
+        to_bytes(render_sms("+91 99887 76655", "मैंने गलती से आपके खाते में ₹2000 भेज दिए हैं"))
+    ]
 
 
 def main() -> None:
@@ -118,6 +142,8 @@ def main() -> None:
     parser.add_argument("--no-classifier", action="store_true")
     parser.add_argument("--model", help="classifier JSON to load instead of the configured one")
     parser.add_argument("-n", type=int, default=20)
+    parser.add_argument("--screenshots", action="store_true", help="POST /analyze/screenshot")
+    parser.add_argument("--no-devanagari", action="store_true", help="local OCR: Latin only")
     args = parser.parse_args()
     if args.model:
         args.model = Path(args.model).resolve()

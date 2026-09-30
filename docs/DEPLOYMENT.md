@@ -22,7 +22,8 @@ Set `ENV=prod` (or `ENV=production`). Every setting is listed in `backend/.env.e
   Behind Render's proxy the client IP is taken from `X-Forwarded-For` (`TRUSTED_PROXY_HOPS=2`).
   The app never uses the leftmost entry, because a client can forge it.
 - **Limits:** text up to 5000 characters (422), JSON bodies up to 64 KB (413), images up to
-  5 MB (413).
+  5 MB (413). `/analyze/screenshot` takes PNG, JPEG or WEBP; anything else is a 422
+  (`unsupported_image`), and so is an image with no readable text (`no_text_found`).
 - **Errors** always come back as `{"error": {"code": "...", "message": "..."}}`. Validation
   errors (422) also include `details: [{field, message}]`. In prod, a 500 says only
   "Internal server error". The full traceback goes to the logs.
@@ -34,6 +35,16 @@ Set `ENV=prod` (or `ENV=production`). Every setting is listed in `backend/.env.e
 - **Memory:** `PATTERN_SIGNAL_ENABLED=false` skips the embedding model (see below). The
   pattern-similarity signal is then reported as unavailable. Its weight is only 0.05, so the
   other signals carry the score.
+- **Screenshots** are read by the Groq vision model `GROQ_VISION_MODEL` (`qwen/qwen3.8-27b`,
+  the only vision-capable model on the free tier as of 2026-09). One phone screenshot costs
+  about 1.3k–1.9k tokens of the model's free 8k tokens/minute (Groq's limits are per model,
+  so this budget is separate from the explanation model's): about four screenshots a minute.
+  A 429 falls through to the next tier. The local
+  OCR fallback (RapidOCR) is off on Render (`LOCAL_OCR_ENABLED=false`, see Memory), so when
+  the vision call fails the route returns 503 `ocr_unavailable`. The image itself is never
+  stored or logged; only the extracted text is saved with the analysis. OCR time is in the
+  saved `latency_ms` (`ocr`, `ocr.groq_vision` / `ocr.local`, `qr`) and in the
+  `screenshot read` log line.
 
 ## Memory (measured locally, Windows, Python 3.12, one uvicorn worker)
 
@@ -42,12 +53,28 @@ Set `ENV=prod` (or `ENV=production`). Every setting is listed in `backend/.env.e
 | `PATTERN_SIGNAL_ENABLED=true` (model loaded) | ~680 MB RSS | ~690 MB RSS |
 | `PATTERN_SIGNAL_ENABLED=false`, `CLASSIFIER_ENABLED=false` | ~120 MB RSS | ~122 MB RSS |
 | `PATTERN_SIGNAL_ENABLED=false`, classifier on (the Render setup) | ~134 MB RSS | ~136 MB RSS (peak 153 MB while loading) |
+| same + local OCR, Latin only (`LOCAL_OCR_DEVANAGARI=false`), 20 screenshots | ~134 MB RSS | ~226 MB RSS (peak 405 MB) |
+| same + local OCR with Devanagari (the local default), 20 screenshots | ~135 MB RSS | ~247 MB RSS (peak 441 MB) |
 
 The classifier rows come from `uv run python -m scripts.measure_memory [--no-classifier]`
 (the real app and route, `POST /analyze/text?explain=false`, no database or network). The
 classifier costs about 14 MB, plus ~30 MB for a moment while its JSON is parsed at startup.
 
-The ONNX model accounts for about 560 MB of that, including the onnxruntime import. Turning
+The OCR rows come from `uv run python -m scripts.measure_memory --screenshots
+[--no-devanagari]`: generated 1080×1400 phone screenshots posted to
+`/analyze/screenshot?explain=false` with the vision model off, so each one goes through the
+local OCR. It loads on the first screenshot, not at startup. Once loaded it holds ~90 MB
+(~110 MB with the Devanagari models), and while it reads an image the process peaks at
+~405–441 MB (Windows peak working set; the detector's memory grows with the pixel count,
+which is why the local OCR reads at 1024 px on the long side). Only one image is read at a
+time. A peak of ~440 MB leaves too little of the free instance's 512 MB for a concurrent
+request and Python's own growth, so `render.yaml` sets `LOCAL_OCR_ENABLED=false` and
+screenshots rely on Groq vision there. On an instance with 1 GB, turn it on.
+Measured on Windows; Linux RSS is usually a little lower, but check `/health` and the
+Render metrics before relying on it.
+
+The embedding (ONNX) model accounts for about 560 MB of the first row, including the
+onnxruntime import. Turning
 off onnxruntime's memory arena and using a single thread didn't change it. The free Render
 instance has 512 MB, so `render.yaml` sets `PATTERN_SIGNAL_ENABLED=false`. To bring the
 signal back, move to an instance with at least 1 GB of RAM or switch to a smaller or
@@ -63,8 +90,10 @@ deploy, the build does three things:
 1. `uv sync --frozen --no-dev`: installs the locked runtime dependencies with Python
    3.12.12 (`PYTHON_VERSION`).
 2. `python -m scripts.download_model`: downloads the embedding model into
-   `backend/.cache/fastembed`, which ships with the build, so a cold start never downloads
-   240 MB. This step is skipped while `PATTERN_SIGNAL_ENABLED=false`.
+   `backend/.cache/fastembed` and the local OCR's Devanagari models (~10 MB) into
+   `backend/.cache/rapidocr`, which ship with the build, so a cold start never downloads
+   them. Each is skipped while its feature is off (`PATTERN_SIGNAL_ENABLED=false`,
+   `LOCAL_OCR_ENABLED=false`), which is the case in `render.yaml`.
 3. `alembic upgrade head`: migrates Supabase.
 
 The service then starts with
@@ -107,6 +136,7 @@ The service then starts with
      ```powershell
      Invoke-RestMethod -Method Post -Uri "https://<url>/analyze/text" -ContentType "application/json" -Body '{"text": "Aapke account me 2000 cashback aaya hai, UPI PIN dalein"}'
      ```
+   - A screenshot (curl, any shell): `curl -F "image=@shot.png" https://<url>/analyze/screenshot`
 7. **Knowledge base.** The scam-pattern rows are already in Supabase if you ran
    `scripts.ingest_patterns` locally. The deployed app doesn't use them while
    `PATTERN_SIGNAL_ENABLED=false`.
@@ -195,6 +225,11 @@ pings to prevent it.
 
 ## Known limitations
 
+- **Screenshots when Groq vision is unavailable:** on Render the local OCR is off (memory), so
+  a vision 429 or outage means 503 for screenshots. Where the local OCR runs, it reads
+  English and Hinglish screenshots almost perfectly (CER ~0.003 on synthetic screenshots)
+  but Devanagari poorly (CER ~0.35; see `ml/reports/*_screenshots.md`), so Hindi screenshots
+  can come back "safe" when the vision model was skipped.
 - **DNS rebinding when following redirects:** before following a short link, the app
   resolves each hop and refuses private or loopback addresses. httpx then resolves the name
   again to connect. A hostile DNS server with a very short TTL could answer "public" to the

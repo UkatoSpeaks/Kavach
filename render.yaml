@@ -20,8 +20,9 @@ services:
         - backend/tests/**
         - backend/ml/**
     # 1. Install locked runtime deps into backend/.venv with Render's Python (see UV_* below).
-    # 2. Download the embedding model into backend/.cache/fastembed, which ships with the
-    #    build (skipped while PATTERN_SIGNAL_ENABLED=false).
+    # 2. Download the embedding model into backend/.cache/fastembed and the local OCR's
+    #    Devanagari models into backend/.cache/rapidocr, which ship with the build (each
+    #    skipped while its feature is off: PATTERN_SIGNAL_ENABLED, LOCAL_OCR_ENABLED).
     # 3. Migrate the database LAST, so a failed install/download never leaves the schema
     #    ahead of the running code. Pre-deploy commands are paid-only; see docs/DEPLOYMENT.md.
     buildCommand: >-
@@ -68,6 +69,9 @@ services:
         value: openai/gpt-oss-20b
       - key: GROQ_REASONING_EFFORT
         value: low
+      # Screenshots: OCR with a vision model (the only vision model on the free tier, 2026-09).
+      - key: GROQ_VISION_MODEL
+        value: qwen/qwen3.8-27b
 
       # --- protection
       - key: RATE_LIMIT_ENABLED
@@ -91,3 +95,8 @@ services:
         value: "false"
       - key: EMBEDDING_CACHE_DIR
         value: .cache/fastembed
+      # The local OCR fallback peaks at ~440 MB RSS while reading a screenshot (~305 MB above
+      # the app's ~136 MB). Off: when Groq vision fails, /analyze/screenshot returns 503
+      # (ocr_unavailable) and the client should ask for the text. docs/DEPLOYMENT.md -> Memory.
+      - key: LOCAL_OCR_ENABLED
+        value: "false"

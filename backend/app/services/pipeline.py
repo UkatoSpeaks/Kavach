@@ -8,6 +8,8 @@ LLM reasoning step between the checks and scoring. The steps themselves live her
   UPI check, run concurrently with asyncio.gather. Every network signal has a timeout and
   fails soft: it shows up as "unavailable" in the breakdown and the rest still returns.
   Then the trained classifier (`classifier_step`: in-process, a few ms, message text only).
+  For screenshots, `screenshot_step` then adds sender_check and fake_payment_proof (pure;
+  they need the rules' and the other signals' results).
 - `finish`: scoring + explanations (pure). Uses the LLM's narrative when there is one.
 
 `analyze_text` (pure, offline) and `analyze` (no LLM) compose them directly, for tests and
@@ -27,7 +29,17 @@ from app.core.config import Settings
 from app.core.enums import EntityType, ScamType, Verdict
 from app.schemas.analysis import AnalysisResult, RedFlag
 from app.schemas.entities import ExtractedEntities
-from app.services import classifier, explain, rag, reputation, rules, scoring, upi, url_intel
+from app.services import (
+    classifier,
+    explain,
+    rag,
+    reputation,
+    rules,
+    scoring,
+    screenshot,
+    upi,
+    url_intel,
+)
 from app.services.cache import LookupCache
 from app.services.extractors import extract_entities
 from app.services.scoring import SignalOutcome, severity_for
@@ -233,6 +245,25 @@ def classifier_step(
         timer.lap(classifier.SOURCE, start)
 
 
+def screenshot_step(
+    ctx: screenshot.ScreenshotContext | None,
+    entities: ExtractedEntities,
+    rule_result: rules.RuleResult,
+    outcomes: list[SignalOutcome],
+    settings: Settings,
+    timer: Timer,
+) -> list[SignalOutcome]:
+    """sender_check and fake_payment_proof, for screenshots only. Pure."""
+    if ctx is None:
+        return []
+    start = time.perf_counter()
+    signals = screenshot.screenshot_signals(
+        ctx, entities, rule_result, outcomes, settings.VERDICT_SUSPICIOUS_MIN
+    )
+    timer.lap("screenshot_signals", start)
+    return signals
+
+
 def analyze_text(text: str, settings: Settings, language_hint: str | None = None) -> PipelineOutput:
     """Pure, offline analysis: extractors, rules, the classifier and UPI checks only."""
     timer = Timer()
@@ -323,6 +354,7 @@ async def analyze(
     checks: Checks | None,
     language_hint: str | None = None,
     message_text: bool = True,
+    screenshot_ctx: screenshot.ScreenshotContext | None = None,
 ) -> PipelineOutput:
     """Full analysis without the LLM. `message_text=False` for bare URL/UPI/QR inputs,
     where the phrase rules have nothing to read and "no rules matched" is no evidence of
@@ -330,4 +362,5 @@ async def analyze(
     timer = Timer()
     entities, rule_result = extract_step(text, timer)
     outcomes = await run_checks(text, entities, settings, checks, message_text, timer)
+    outcomes += screenshot_step(screenshot_ctx, entities, rule_result, outcomes, settings, timer)
     return finish(entities, rule_result, outcomes, settings, language_hint, message_text, timer)

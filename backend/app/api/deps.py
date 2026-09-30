@@ -9,6 +9,7 @@ from app.core.config import Settings, get_settings
 from app.db.session import SessionFactory
 from app.services import rag
 from app.services.agent.llm import Reasoner
+from app.services.ocr import ScreenshotReader
 
 
 async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
@@ -60,3 +61,8 @@ def get_reasoner(request: Request) -> Reasoner | None:
     """The Groq reasoner created at startup, or None (no GROQ_API_KEY): then the LLM
     signal is reported unavailable and template explanations are used."""
     return getattr(request.app.state, "reasoner", None)
+
+
+def get_ocr_reader(request: Request) -> ScreenshotReader | None:
+    """The screenshot reader created at startup (Groq vision and/or the local OCR)."""
+    return getattr(request.app.state, "ocr_reader", None)

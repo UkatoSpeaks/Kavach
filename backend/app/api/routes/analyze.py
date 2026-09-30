@@ -1,17 +1,20 @@
 import asyncio
 import logging
+import re
 import time
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Query, UploadFile
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import (
     get_http_client,
+    get_ocr_reader,
     get_pattern_search,
     get_reasoner,
     get_session,
@@ -23,14 +26,16 @@ from app.core.config import Settings, get_settings
 from app.core.enums import InputType
 from app.db.models import Analysis
 from app.db.session import SessionFactory
-from app.schemas.analysis import AnalysisResult
+from app.schemas.analysis import AnalysisResult, ScreenshotAnalysisResult
 from app.schemas.entities import ExtractedEntities
-from app.services import qr, rag, reputation
+from app.services import ocr, qr, rag, reputation
 from app.services.agent.graph import run_analysis
 from app.services.agent.llm import Reasoner
 from app.services.cache import LookupCache
 from app.services.extractors import extract_upi_ids, extract_urls, parse_upi_uri
+from app.services.ocr import ScreenshotReader
 from app.services.pipeline import Checks, PipelineOutput
+from app.services.screenshot import ScreenshotContext
 
 router = APIRouter(tags=["analysis"])
 logger = logging.getLogger(__name__)
@@ -275,6 +280,101 @@ async def analyze_qr_route(
         explain=explain,
     )
     return save(out, InputType.QR, decoded.payload)
+
+
+# Fewer letters/digits than this: nothing to analyze ("no readable text found").
+MIN_SCREENSHOT_CHARS = 3
+_WORD_CHAR = re.compile(r"\w")
+OCRReaderDep = Annotated[ScreenshotReader | None, Depends(get_ocr_reader)]
+
+
+@router.post(
+    "/analyze/screenshot",
+    response_model=ScreenshotAnalysisResult,
+    dependencies=[ANALYZE_LIMIT],
+    responses={
+        413: {"description": "Image larger than 5 MB"},
+        422: {"description": "Not a PNG/JPEG/WEBP image, or no readable text in it"},
+        503: {"description": "No OCR engine could read the image (all unavailable)"},
+    },
+)
+async def analyze_screenshot_route(
+    save: SaverDep,
+    settings: SettingsDep,
+    checks: ChecksDep,
+    reasoner: ReasonerDep,
+    reader: OCRReaderDep,
+    image: Annotated[UploadFile, File(description="PNG, JPEG or WEBP, max 5 MB")],
+    language_hint: Annotated[
+        Literal["en", "hi", "hinglish"] | None,
+        Form(description="'hi' returns advice in Hindi. Explanations are always both."),
+    ] = None,
+    explain: ExplainQuery = True,
+) -> ScreenshotAnalysisResult:
+    """OCR (Groq vision, else local) -> the usual analysis on the extracted text, plus the
+    screenshot signals (sender_check, fake_payment_proof). A QR code in the image is decoded
+    and analyzed with the text. The image is never stored."""
+    data = await image.read(ocr.MAX_IMAGE_BYTES + 1)
+    try:
+        prepared = await asyncio.to_thread(ocr.prepare_image, data)
+    except ocr.ImageTooLargeError as exc:
+        raise ApiError(413, str(exc), code="image_too_large") from exc
+    except ocr.UnsupportedImageError as exc:
+        raise ApiError(422, str(exc), code="unsupported_image") from exc
+    if reader is None:
+        raise ApiError(503, "screenshot reading is not configured", code="ocr_unavailable")
+
+    async def find_qr() -> tuple[qr.QRPayload | None, float]:
+        start = time.perf_counter()
+        try:
+            found = await asyncio.to_thread(qr.find_qr, prepared.full)
+        except Exception as exc:  # fail soft: the text is still analyzed
+            logger.warning("screenshot QR decoding failed: %s: %s", type(exc).__name__, exc)
+            found = None
+        return found, round((time.perf_counter() - start) * 1000, 2)
+
+    start = time.perf_counter()
+    read, (found, qr_ms) = await asyncio.gather(reader.read(prepared), find_qr())
+    ocr_ms = round((time.perf_counter() - start) * 1000, 2)
+    logger.info(
+        "screenshot read",
+        extra={"extra_fields": {
+            "ocr_engine": read.engine, "ocr_ms": ocr_ms, "chars": len(read.text),
+            "qr": found is not None, "notes": list(read.notes),
+        }},
+    )  # fmt: skip
+    qr_payload = found.payload if found else None
+    text = "\n".join(t for t in (read.text, qr_payload) if t)[:MAX_TEXT_CHARS]
+    if len(_WORD_CHAR.findall(text)) < MIN_SCREENSHOT_CHARS:
+        if read.engine == "none":
+            raise ApiError(
+                503,
+                "could not read the screenshot right now; paste the message text instead",
+                code="ocr_unavailable",
+            )
+        raise ApiError(422, "no readable text found in the image", code="no_text_found")
+
+    out = await run_analysis(
+        text,
+        settings,
+        checks=checks,
+        reasoner=reasoner,
+        language_hint=language_hint,
+        explain=explain,
+        screenshot=ScreenshotContext(read.sender, read.app, read.is_payment_receipt),
+    )
+    out = replace(out, latency_ms={**out.latency_ms, **read.latency_ms, "ocr": ocr_ms, "qr": qr_ms})
+    result = save(out, InputType.SCREENSHOT, text, language_hint)
+    return ScreenshotAnalysisResult(
+        **result.model_dump(),
+        extracted_text=read.text,
+        ocr_engine=read.engine,
+        sender=read.sender,
+        app=read.app,
+        is_payment_receipt=read.is_payment_receipt,
+        qr_payload=qr_payload,
+        ocr_notes=list(read.notes),
+    )
 
 
 @router.get("/analysis/{analysis_id}", response_model=AnalysisResult)

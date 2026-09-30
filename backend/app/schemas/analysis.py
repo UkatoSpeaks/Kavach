@@ -70,3 +70,22 @@ class AnalysisResult(BaseModel):
         default_factory=list,
         description="UPI IDs, phone numbers and link domains found in the input, for POST /report.",
     )
+
+
+class ScreenshotAnalysisResult(AnalysisResult):
+    """POST /analyze/screenshot: the analysis plus what OCR read. The image is never stored,
+    and GET /analysis/{id} returns only the AnalysisResult part."""
+
+    extracted_text: str = Field(description="The text OCR read; this is what was analyzed.")
+    ocr_engine: Literal["groq_vision", "local", "none"]
+    sender: str | None = Field(default=None, description="Sender name, number or SMS header.")
+    app: Literal["sms", "whatsapp", "email", "payment_app", "other"] | None = None
+    is_payment_receipt: bool = Field(
+        default=False, description="The image is a UPI/bank 'payment successful' screen."
+    )
+    qr_payload: str | None = Field(
+        default=None, description="A QR code found in the image, analyzed with the text."
+    )
+    ocr_notes: list[str] = Field(
+        default_factory=list, description="Why an OCR engine was skipped or failed."
+    )

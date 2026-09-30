@@ -22,6 +22,7 @@ from app.services.agent.graph import get_graph
 from app.services.agent.llm import GroqReasoner, LRUTTLCache
 from app.services.classifier import get_classifier
 from app.services.embeddings import FastEmbedder
+from app.services.ocr import GroqVisionOCR, RapidLocalOCR, ScreenshotReader
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.GROQ_API_KEY
         else None
     )
+    # Screenshots. The local OCR loads its models on first use, not here.
+    app.state.ocr_reader = ScreenshotReader(
+        vision=GroqVisionOCR(
+            api_key=settings.GROQ_API_KEY,
+            base_url=settings.GROQ_BASE_URL,
+            model=settings.GROQ_VISION_MODEL,
+            timeout_s=settings.VISION_TIMEOUT_S,
+        )
+        if settings.GROQ_API_KEY and settings.GROQ_VISION_MODEL
+        else None,
+        local=RapidLocalOCR(
+            settings.LOCAL_OCR_CACHE_DIR, settings.LOCAL_OCR_DEVANAGARI, settings.LOCAL_OCR_MAX_SIDE
+        )
+        if settings.LOCAL_OCR_ENABLED
+        else None,
+    )
     logger.info(
         "startup complete",
         extra={
@@ -68,6 +85,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "pattern_signal": settings.PATTERN_SIGNAL_ENABLED,
                 "classifier": classifier_loaded,
                 "llm": app.state.reasoner is not None,
+                "vision_ocr": app.state.ocr_reader.vision is not None,
+                "local_ocr": settings.LOCAL_OCR_ENABLED,
             }
         },
     )

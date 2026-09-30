@@ -187,3 +187,18 @@ class FakeReasoner:
         if a is None:
             return ReasonResult(None, None, ("fake-model: rate limited (429)",))
         return ReasonResult(a, "fake-model")
+
+
+class FakeLocalOCR:
+    """Stands in for RapidLocalOCR: returns `text` (or raises it, if an exception) and counts
+    calls. The real engine is tested in tests/test_ocr.py."""
+
+    def __init__(self, text: str | Exception = "") -> None:
+        self.text = text
+        self.calls = 0
+
+    def read(self, image: Any) -> str:
+        self.calls += 1
+        if isinstance(self.text, Exception):
+            raise self.text
+        return self.text
