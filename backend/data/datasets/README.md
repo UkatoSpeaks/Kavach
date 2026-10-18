@@ -167,6 +167,39 @@ look at. Not handled: names that don't follow a greeting (e.g. "from RAMESH KUMA
 credit alert), addresses, Aadhaar/PAN numbers. Preview with
 `uv run python -m ml.anonymize collected/<file>.csv` and remove anything it misses.
 
+## Polished evaluation set (`polished_eval.csv`)
+
+**Synthetic, hand-written (Claude), evaluation only, never training.**
+`ml/train_classifier.py` refuses to run if one of its messages is in train/val, and
+`tests/test_polished_eval.py` checks the splits. It is not personal data, so unlike the
+rest of this folder it is not gitignored.
+
+40 "polished" scams: perfect spelling, real bank/brand names, a calm tone, no leetspeak and
+no pile of urgency words. The only giveaway is the link (a shortener, a lookalike or a
+days-old domain), a personal mobile number, or the request itself. Plus 40 genuine
+messages written the same clean way: bank alerts, KYC reminders that point to the app or
+branch, card-blocked confirmations, bills, e-challans on parivahan.gov.in, courier and
+customs notices, refunds, recruiters, support replies, and brand short links (zoma.to,
+hdfcbk.io, i.airtel.in, a bit.ly to 1mg.com). Both halves cover the v1 types in English,
+Hinglish and Hindi.
+
+Columns: `id` (ps = scam, pg = genuine), `text`, `label`, `scam_type`, `category` (kyc, account,
+electricity, e_challan, parcel_customs, refund, job, customer_care, bank_alert, brand_link:
+the report's groups, so each shows scam recall and genuine FPR together), `language`,
+`giveaway` (what gives the scam away), `source`, `is_synthetic`, `label_source`.
+
+Scam domains are invented and were unregistered (RDAP 404 at the registry) on 2026-10-19.
+Phone numbers are 99999 numbers; account, card, vehicle and PNR numbers are masked.
+`polished_eval_network.json` is the fake internet for `ml/evaluate.py --mock-network`
+(`ml/mock_network.py`): every shortened link's redirect chain, scam domains a few days to a
+few months old, and the real RDAP registration dates of the real domains (or no record,
+for TLDs without RDAP such as .io, .it and .me).
+
+```
+uv run python -m ml.evaluate --dataset polished --name polished_offline
+uv run python -m ml.evaluate --dataset polished --modes checks --name polished_mocknet --mock-network data/datasets/polished_eval_network.json
+```
+
 ## Unified schema (processed/*.csv)
 
 `id, text, label, original_label, scam_type, language, source, dataset, is_synthetic,

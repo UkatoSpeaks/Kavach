@@ -13,7 +13,9 @@ Modes (--modes, comma-separated):
 
 Without --network, url_intel and reputation are reported unavailable, so runs are offline
 and reproducible. With it, links are expanded/looked up and reputation is read from the
-database (DATABASE_URL).
+database (DATABASE_URL). --mock-network FIXTURE.json runs url_intel's real code against a
+fake internet instead (ml/mock_network.py: RDAP ages and redirect chains from the fixture,
+no reputation reports, no Safe Browsing): offline, but with the network signals.
 
 "Flagged" = verdict suspicious or scam. Positives: label "scam" (collected data), or the
 public datasets' "spam"/"smishing" (NOT the same thing as our "scam"; see the report).
@@ -24,6 +26,9 @@ public datasets' "spam"/"smishing" (NOT the same thing as our "scam"; see the re
     uv run python -m ml.evaluate --dataset collected --modes checks   # every message
     uv run python -m ml.evaluate --dataset test --modes rules,checks,llm --llm-limit 30
     uv run python -m ml.evaluate --dataset path/to/file.csv --name my_set   # text,label
+    uv run python -m ml.evaluate --dataset polished --name polished_offline
+    uv run python -m ml.evaluate --dataset polished --modes checks --name polished_mocknet
+        --mock-network data/datasets/polished_eval_network.json   # (one command)
 
 Reports quote messages. A set that contains your collected messages (any row with dataset
 "collected": collected, and the val/test splits) or a custom CSV is written to
@@ -56,7 +61,15 @@ from app.services.cache import LookupCache
 from app.services.embeddings import FastEmbedder
 from app.services.knowledge_base import load_docs
 from ml.autolabel import UNCERTAIN
-from ml.common import OOD_LABELS, PROCESSED_DIR, REPORTS_DIR, guess_language, read_csv
+from ml.common import (
+    OOD_LABELS,
+    POLISHED_EVAL,
+    PROCESSED_DIR,
+    REPORTS_DIR,
+    guess_language,
+    read_csv,
+)
+from ml.mock_network import MockNetwork, fake_dns, no_reports
 
 # Reports that quote your collected messages. Gitignored (see the repository .gitignore).
 PRIVATE_REPORTS_DIR = REPORTS_DIR / "private"
@@ -117,6 +130,15 @@ INDIA_SPAM_CAVEAT = (
     "the **false-positive rates** (ham, and promo spam) below, not recall. Reviewed rows "
     "count as label_source manual (you) or assisted (Claude). Uncertain rows are left out."
 )
+POLISHED_CAVEAT = (
+    "**Synthetic, hand-written (Claude), never used for training.** 40 polished scams "
+    "(perfect spelling, real bank/brand names, calm tone: the only giveaway is the link, a "
+    "personal phone number or the request itself) and 40 genuine messages written the same "
+    "clean way, across the v1 types, in English, Hinglish and Hindi. Scam domains are "
+    "invented and were unregistered (RDAP 404) when written. Groups are categories (kyc, "
+    "account, electricity, ...): each shows scam recall and genuine FPR side by side. A "
+    "stress test of what the detector relies on, not a prevalence estimate: 50% scams."
+)
 COLLECTED_CAVEAT = (
     "**Your collected messages** (anonymized), every one, labelled by you. Too few for a "
     "rate to mean much: read the per-message table."
@@ -152,6 +174,7 @@ def load_csv_set(path: Path, name: str, caveat: str, private: bool = False) -> E
         # promo_spam is not a scam (a negative), but keeps its own group so its
         # false-positive rate shows separately from genuine messages.
         group = (scam_type or original or label) if positive else (label or "genuine")
+        group = (r.get("category") or "").strip() or group  # a set's own grouping, if any
         lang = r.get("language") or guess_language(r["text"])
         items.append(Item(r.get("id") or str(i), r["text"], positive, group, lang, scam_type,
                           label, (r.get("label_source") or "").strip()))  # fmt: skip
@@ -172,6 +195,8 @@ def test_split_notes() -> tuple[str, ...]:
 def load_eval_set(dataset: str) -> EvalSet:
     if dataset == "examples":
         return load_examples()
+    if dataset == "polished":  # synthetic: no personal data, the report can be shared
+        return load_csv_set(POLISHED_EVAL, "polished", POLISHED_CAVEAT)
     named = {
         "uci": ("ood_uci_sms_spam.csv", UCI_CAVEAT),
         "mendeley": ("ood_mendeley_sms_phishing.csv",
@@ -530,7 +555,7 @@ def by_label_source(label: str, preds: Sequence[Prediction]) -> list[tuple[str, 
     return groups
 
 
-def render(es: EvalSet, runs: list[ModeRun], settings: Settings, network: bool, name: str) -> str:
+def render(es: EvalSet, runs: list[ModeRun], settings: Settings, network: str, name: str) -> str:
     pos = sum(it.positive for it in es.items)
     lines = [
         f"# Evaluation: {name}",
@@ -540,7 +565,9 @@ def render(es: EvalSet, runs: list[ModeRun], settings: Settings, network: bool, 
         f"- date: {date.today().isoformat()} · code: `{_git_rev()}`",
         f"- messages: {len(es.items)} ({pos} positives = {es.positive_desc}; "
         f"{len(es.items) - pos} negatives)",
-        f"- network checks (url_intel, reputation): {'ON' if network else 'OFF (offline)'}",
+        f"- network checks (url_intel, reputation): {network}",
+        "- classifier: "
+        + ("on" if settings.CLASSIFIER_ENABLED else "OFF (CLASSIFIER_ENABLED=false)"),
         f"- weights: `{settings.SIGNAL_WEIGHTS}` · thresholds: suspicious ≥ "
         f"{settings.VERDICT_SUSPICIOUS_MIN}, scam ≥ {settings.VERDICT_SCAM_MIN}",
         '- flagged = verdict suspicious or scam. "scam-only" counts only verdict scam.',
@@ -598,18 +625,25 @@ async def run(args: argparse.Namespace) -> None:
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     if bad := [m for m in modes if m not in MODES]:
         sys.exit(f"unknown mode(s) {bad}; choose from {MODES}")
+    if args.network and args.mock_network:
+        sys.exit("--network and --mock-network: choose one")
+    mock = MockNetwork.load(Path(args.mock_network)) if args.mock_network else None
     # Safe Browsing only with --network, whatever .env says.
     settings = get_settings()
     if not args.network:
         settings = settings.model_copy(update={"SAFE_BROWSING_API_KEY": ""})
-    print(f"{name}: {len(es.items)} messages, modes {modes}, network "
-          f"{'on' if args.network else 'off'}")  # fmt: skip
+    if mock:
+        network = (f"MOCKED ({Path(args.mock_network).name}: url_intel on a fake internet, "
+                   "no reputation reports, no Safe Browsing)")  # fmt: skip
+    else:
+        network = "ON" if args.network else "OFF (offline)"
+    print(f"{name}: {len(es.items)} messages, modes {modes}, network {network}")
 
     runs: list[ModeRun] = []
     async with AsyncExitStack() as stack:
         checks: pipeline.Checks | None = None
         if "checks" in modes or "llm" in modes:
-            checks = await _build_checks(settings, args.network, stack)
+            checks = await _build_checks(settings, args.network, stack, mock)
 
         async def rules_only(text: str) -> AnalysisResult:
             return pipeline.analyze_text(text, settings).result
@@ -655,8 +689,11 @@ async def run(args: argparse.Namespace) -> None:
             same = [checks_preds[it.id] for it in sample if it.id in checks_preds]
             runs.append(ModeRun("llm (full pipeline)", preds, note, same))
 
+    if mock and mock.unknown:  # the fixture had no answer: RDAP 404 / no redirect used
+        es = replace(es, notes=(*es.notes, "not in the network fixture (answered RDAP 404 / "
+                                f"no redirect): {', '.join(sorted(mock.unknown))}"))  # fmt: skip
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(render(es, runs, settings, args.network, name), encoding="utf-8")
+    out.write_text(render(es, runs, settings, network, name), encoding="utf-8")
     print(f"\nreport: {out}\n")
     if note := label_note(es, name):
         print(note + "\n")
@@ -674,10 +711,11 @@ async def run(args: argparse.Namespace) -> None:
 
 
 async def _build_checks(
-    settings: Settings, network: bool, stack: AsyncExitStack
+    settings: Settings, network: bool, stack: AsyncExitStack, mock: MockNetwork | None = None
 ) -> pipeline.Checks:
     """Pattern retrieval runs in memory over the knowledge-base docs with the real local
-    embedding model: no database needed, same docs as scripts/ingest_patterns.py."""
+    embedding model: no database needed, same docs as scripts/ingest_patterns.py. With
+    `mock`, url_intel and reputation run against ml/mock_network.py instead of the network."""
     import httpx
 
     from app.api.deps import new_http_client
@@ -695,6 +733,11 @@ async def _build_checks(
               "pattern_similarity will be missing")  # fmt: skip
 
     ttl = timedelta(hours=settings.URL_CACHE_TTL_HOURS)
+    if mock is not None:
+        client = mock.client()
+        await stack.enter_async_context(client)
+        stack.enter_context(fake_dns())
+        return pipeline.Checks(client, LookupCache(None, ttl), no_reports, patterns)
     if not network:
         client = httpx.AsyncClient()  # never used: url_intel is off
         await stack.enter_async_context(client)
@@ -718,7 +761,7 @@ def main() -> None:
     parser.add_argument(
         "--dataset",
         default="examples",
-        help="examples | uci | mendeley | test | val | india | collected | path to a CSV",
+        help="examples | uci | mendeley | test | val | india | collected | polished | a CSV path",
     )
     parser.add_argument("--name", help="report name (default: the dataset name)")
     parser.add_argument("--modes", default="rules,checks", help=f"comma-separated: {MODES}")
@@ -727,6 +770,12 @@ def main() -> None:
         action="store_true",
         help="run url_intel (link expansion, RDAP, Safe Browsing) and "
         "reputation (database); off by default for reproducible runs",
+    )
+    parser.add_argument(
+        "--mock-network",
+        metavar="FIXTURE",
+        help="run url_intel against a fake internet from this JSON fixture (RDAP ages, "
+        "redirects; see ml/mock_network.py) instead of the network",
     )
     parser.add_argument(
         "--llm-limit",

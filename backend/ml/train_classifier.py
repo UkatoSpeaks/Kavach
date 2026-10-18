@@ -43,7 +43,7 @@ from sklearn.metrics import f1_score, log_loss
 
 from app.core.config import get_settings
 from app.services.classifier import MODEL_FORMAT, ScamClassifier
-from ml.common import LABELS, PROCESSED_DIR, as_bool, read_csv
+from ml.common import LABELS, PROCESSED_DIR, as_bool, polished_leaks, read_csv
 from ml.features import FEATURES_VERSION, char_ngrams, preprocess, word_ngrams
 
 CLASSES = sorted(LABELS)  # ["genuine", "promo_spam", "scam"]: scikit-learn's order too
@@ -202,6 +202,10 @@ def main() -> None:
     if leaked := [r["id"] for r in train + val if r["dataset"] == "collected"]:
         sys.exit(f"{len(leaked)} collected message(s) in train/val: they are test-only. "
                  "Re-run: uv run python -m ml.prepare_dataset")  # fmt: skip
+    if leaked := polished_leaks(train + val):
+        sys.exit(f"{len(leaked)} polished evaluation message(s) in train/val "
+                 f"({', '.join(leaked[:5])}): data/datasets/polished_eval.csv is "
+                 "test-only.")  # fmt: skip
     if args.no_synthetic:
         train = [r for r in train if not as_bool(r["is_synthetic"])]
     print(f"train {len(train)} {_counts(train, 'label')}; synthetic "

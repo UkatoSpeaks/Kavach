@@ -1,0 +1,193 @@
+{
+  "_about": "Mocked network for ml.evaluate --mock-network on polished_eval.csv. RDAP answers: age_days = registered that many days before the run (scam domains, all verified unregistered by an RDAP 404 at their registry on 2026-10-19); registered = the real RDAP registration date of a real domain (fetched 2026-10-19); rdap false = the TLD has no RDAP service, as for real. redirects: what each shortened link answers (a Location, or an HTTP status). Every hostname resolves to a public address. Safe Browsing is off and reputation has no reports: new scam infrastructure is usually on neither list yet.",
+  "domains": {
+    "1mg.com": {
+      "registered": "2000-08-09"
+    },
+    "airtel.in": {
+      "registered": "2005-01-06"
+    },
+    "axis-secure-review.com": {
+      "age_days": 3,
+      "scam_infrastructure": true
+    },
+    "bijli-upbhokta-seva.in": {
+      "age_days": 6,
+      "scam_infrastructure": true
+    },
+    "bit.ly": {
+      "registered": "2008-05-17"
+    },
+    "bluedart-clearance.in": {
+      "age_days": 3,
+      "scam_infrastructure": true
+    },
+    "bob-card-services.in": {
+      "age_days": 75,
+      "scam_infrastructure": true
+    },
+    "bses-billdesk.in": {
+      "age_days": 5,
+      "scam_infrastructure": true
+    },
+    "bsesdelhi.com": {
+      "registered": "2002-06-29"
+    },
+    "customer-reverify.in": {
+      "age_days": 9,
+      "scam_infrastructure": true
+    },
+    "cutt.ly": {
+      "registered": "2018-01-13"
+    },
+    "dbt-subsidy-refund.in": {
+      "age_days": 6,
+      "scam_infrastructure": true
+    },
+    "dhl.com": {
+      "registered": "1989-05-25"
+    },
+    "dtdc-track-delivery.in": {
+      "age_days": 110,
+      "scam_infrastructure": true
+    },
+    "echallan-onlinepay.in": {
+      "age_days": 2,
+      "scam_infrastructure": true
+    },
+    "echallan-parivahan.in": {
+      "age_days": 3,
+      "scam_infrastructure": true
+    },
+    "fkrt.it": {
+      "rdap": false,
+      "why": "no RDAP service for .it"
+    },
+    "hdfc-kyc-renewal.in": {
+      "age_days": 2,
+      "scam_infrastructure": true
+    },
+    "hdfc-netbanking-verify.com": {
+      "age_days": 8,
+      "scam_infrastructure": true
+    },
+    "hdfc-rekyc-update.in": {
+      "age_days": 3,
+      "scam_infrastructure": true
+    },
+    "hdfcbank.com": {
+      "registered": "1997-04-10"
+    },
+    "hdfcbk.io": {
+      "rdap": false,
+      "why": "no RDAP service for .io"
+    },
+    "incometax-refund-status.in": {
+      "age_days": 21,
+      "scam_infrastructure": true
+    },
+    "indiapost-redelivery.in": {
+      "age_days": 4,
+      "scam_infrastructure": true
+    },
+    "is.gd": {
+      "registered": "2007-09-12"
+    },
+    "kotak-vkyc.co.in": {
+      "age_days": 4,
+      "scam_infrastructure": true
+    },
+    "mahadiscom.in": {
+      "registered": "2005-05-28"
+    },
+    "mahavitaran-billpay.in": {
+      "age_days": 4,
+      "scam_infrastructure": true
+    },
+    "merchant-taskdesk.com": {
+      "age_days": 45,
+      "scam_infrastructure": true
+    },
+    "naukri.com": {
+      "registered": "1997-03-27"
+    },
+    "netbanking-sevakendra.in": {
+      "age_days": 11,
+      "scam_infrastructure": true
+    },
+    "parivahan-samadhan.co.in": {
+      "age_days": 7,
+      "scam_infrastructure": true
+    },
+    "paytm-wallet-restore.in": {
+      "age_days": 4,
+      "scam_infrastructure": true
+    },
+    "pnb-kyc-seva.in": {
+      "age_days": 5,
+      "scam_infrastructure": true
+    },
+    "rb.gy": {
+      "registered": "2019-09-17"
+    },
+    "sbi-yono-relogin.in": {
+      "age_days": 2,
+      "scam_infrastructure": true
+    },
+    "speedpost-delivery-help.in": {
+      "age_days": 5,
+      "scam_infrastructure": true
+    },
+    "t.me": {
+      "rdap": false,
+      "why": "no RDAP service for .me"
+    },
+    "tatapower-ddl.com": {
+      "registered": "2011-12-17"
+    },
+    "tinyurl.com": {
+      "registered": "2002-01-27"
+    },
+    "up-echallan-pay.in": {
+      "age_days": 2,
+      "scam_infrastructure": true
+    },
+    "uppcl.org": {
+      "registered": "2001-02-02"
+    },
+    "vcourt-challan.in": {
+      "age_days": 12,
+      "scam_infrastructure": true
+    },
+    "wa.me": {
+      "rdap": false,
+      "why": "no RDAP service for .me"
+    },
+    "yono-sbi-profile.in": {
+      "age_days": 6,
+      "scam_infrastructure": true
+    },
+    "zoma.to": {
+      "registered": "2010-10-21"
+    }
+  },
+  "redirects": {
+    "bit.ly/3Kq8vZt": "https://hdfc-rekyc-update.in/kyc/verify",
+    "bit.ly/4mT2wQx": "https://hdfc-kyc-renewal.in/",
+    "tinyurl.com/icici-rekyc": "https://customer-reverify.in/icici/login",
+    "cutt.ly/pnbKyc7": "https://pnb-kyc-seva.in/update",
+    "rb.gy/k3v9qa": "https://paytm-wallet-restore.in/",
+    "bit.ly/3yonoSB": "https://sbi-yono-relogin.in/login",
+    "tinyurl.com/netbank-seva": "https://is.gd/Nb7kQ2",
+    "is.gd/Nb7kQ2": "https://netbanking-sevakendra.in/login",
+    "cutt.ly/mseb-bill": "https://mahavitaran-billpay.in/pay",
+    "bit.ly/bijli-kyc": "https://bijli-upbhokta-seva.in/",
+    "tinyurl.com/vcourt-challan": "https://vcourt-challan.in/case",
+    "rb.gy/echln5": "https://echallan-onlinepay.in/",
+    "cutt.ly/echallan-up": "https://up-echallan-pay.in/",
+    "bit.ly/bd-customs": "https://bluedart-clearance.in/pay",
+    "tinyurl.com/parcel-pata": "https://speedpost-delivery-help.in/",
+    "bit.ly/subsidy-refund": 404,
+    "bit.ly/1mgTrk82": "https://www.1mg.com/my-orders/track"
+  }
+}

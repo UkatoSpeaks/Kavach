@@ -25,6 +25,9 @@ REVIEWED_LABELS = DATASETS_DIR / "reviewed_labels.csv"
 # Low-confidence AI-assisted labels, written by ml/apply_review.py for you to check
 # (gitignored). Your edits there are applied as "manual" on the next ml/apply_review.py run.
 LOW_CONFIDENCE = DATASETS_DIR / "review_low_confidence.csv"
+# Synthetic "polished" scams and hard genuine messages (ml/evaluate.py --dataset polished).
+# Evaluation only: ml/train_classifier.py refuses to train if one of them is in train/val.
+POLISHED_EVAL = DATASETS_DIR / "polished_eval.csv"
 # label_source: empty or "manual" = you; "assisted" = labelled by an AI assistant (Claude)
 # reading the row, not by you. label_reason / confidence: the labeller's note (optional).
 REVIEW_COLUMNS = ("id", "text", "auto_label", "auto_scam_type", "top_signals", "my_label",
@@ -154,6 +157,14 @@ def read_csv(path: Path) -> list[dict[str, str]]:
     # utf-8-sig: Excel on Windows saves CSVs with a BOM.
     with path.open(encoding="utf-8-sig", newline="") as f:
         return [dict(row) for row in csv.DictReader(f)]
+
+
+def polished_leaks(rows: Iterable[Mapping[str, str]]) -> list[str]:
+    """Ids of the rows whose (normalized) text is one of the polished evaluation messages."""
+    if not POLISHED_EVAL.exists():
+        return []
+    held_out = {text_id(r["text"]) for r in read_csv(POLISHED_EVAL)}
+    return [r["id"] for r in rows if text_id(r["text"]) in held_out]
 
 
 def write_csv(path: Path, rows: Iterable[Mapping[str, Any]], columns: Iterable[str]) -> int:
