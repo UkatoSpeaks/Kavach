@@ -56,6 +56,52 @@ def test_no_signals_scores_zero() -> None:
     assert combine_signals([], WEIGHTS) == (0, [])
 
 
+# ----------------------------------------------------------------------------- corroboration
+
+GATED = SignalOutcome("classifier", 98, needs_corroboration=True)
+
+
+def test_uncorroborated_signal_stays_below_suspicious() -> None:
+    result = score(rule_result(), WEIGHTS, T, [GATED])
+    assert result.risk_score == T.suspicious_min - 1 and result.verdict is Verdict.SAFE
+    assert result.uncorroborated == ("classifier",)
+    detail = next(s.detail for s in result.signal_breakdown if s.source == "classifier")
+    assert "no other signal corroborates it" in detail
+
+
+def test_supporting_or_weak_rules_do_not_corroborate() -> None:
+    # short_url is supporting-only; money_back_request (0.2) is below corroboration_min
+    for rules in (rule_result("short_url"), rule_result("money_back_request")):
+        assert score(rules, WEIGHTS, T, [GATED]).uncorroborated == ("classifier",)
+
+
+@pytest.mark.parametrize(
+    ("rules", "extra"),
+    [
+        (rule_result("lookalike_domain"), []),
+        (rule_result("short_url"), [SignalOutcome("url_intel", 60)]),  # a new domain
+    ],
+)
+def test_corroborated_signal_counts_in_full(rules: RuleResult, extra: list) -> None:
+    result = score(rules, WEIGHTS, T, [GATED, *extra])
+    plain = score(rules, WEIGHTS, T, [SignalOutcome("classifier", 98), *extra])
+    assert result.uncorroborated == () and result.risk_score == plain.risk_score
+
+
+def test_pipeline_gate_and_bypass() -> None:
+    """The classifier alone on a clean-looking scam: counted without the gate, capped with
+    it, counted again when its P(scam) reaches the bypass."""
+    text = "Your trial is over. Our coordinator will guide you on the next step, reply YES now"
+    s = get_settings().model_copy(update={"CLASSIFIER_MIN_SCAM_PROBABILITY": 0.0})
+    p = analyze_text(text, s).result
+    clf = next(x for x in p.signal_breakdown if x.source == "classifier")
+    gated = s.model_copy(update={"CLASSIFIER_REQUIRES_CORROBORATION": True})
+    capped = analyze_text(text, gated).result
+    assert capped.risk_score <= min(p.risk_score, T.suspicious_min - 1)
+    bypassed = gated.model_copy(update={"CLASSIFIER_CORROBORATION_BYPASS": clf.score / 100})
+    assert analyze_text(text, bypassed).result.risk_score == p.risk_score
+
+
 @pytest.mark.parametrize(
     ("risk", "verdict"),
     [(0, Verdict.SAFE), (34, Verdict.SAFE), (35, Verdict.SUSPICIOUS), (69, Verdict.SUSPICIOUS),

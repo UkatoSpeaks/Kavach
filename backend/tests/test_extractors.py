@@ -103,6 +103,8 @@ def test_no_false_urls(text: str) -> None:
         "Unlimited calls for 56D.Shop now at the nearest store",
         "Pay Rs.499.Click here to know more",
         "Order 3X.Click to track your points",
+        "Thanks for the update.It was very helpful",  # .it and .to are words too
+        "Your parcel is ready.To collect it bring ID",
     ],
 )
 def test_missing_space_after_full_stop_is_not_a_url(text: str) -> None:
@@ -120,6 +122,10 @@ def test_missing_space_after_full_stop_is_not_a_url(text: str) -> None:
         ("Withdraw at 4ab.Click/x now", "http://4ab.click/x"),  # has a path
         ("Withdraw at k3z9.click now", "http://k3z9.click"),  # lower-case TLD
         ("Open www.Deals.Shop now", "http://www.deals.shop"),  # www.
+        ("Restore access here: rb.gy/k3v9qa", "http://rb.gy/k3v9qa"),
+        ("Track it live: zoma.to/r/8Kp3x", "http://zoma.to/r/8Kp3x"),
+        ("Track: fkrt.it/Xq7PvRuuuN", "http://fkrt.it/Xq7PvRuuuN"),
+        ("Order now: swig.gy/offers", "http://swig.gy/offers"),
     ],
 )
 def test_bare_domains_still_found(text: str, url: str) -> None:

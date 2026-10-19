@@ -205,7 +205,7 @@ def sender_signal(
 def _header_signal(
     sender: Sender, rule_result: RuleResult, outcomes: list[SignalOutcome], suspicious_min: int
 ) -> SignalOutcome:
-    strong_rules = [h for h in rule_result.hits if h.rule.weight >= _HEADER_BLOCKING_RULE_WEIGHT]
+    strong_rules = [h for h in rule_result.hits if h.weight >= _HEADER_BLOCKING_RULE_WEIGHT]
     other_risk = [
         o.source for o in outcomes
         if o.informative and o.score is not None and o.score >= suspicious_min

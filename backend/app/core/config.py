@@ -22,6 +22,15 @@ RULE_WEIGHTS: dict[str, float] = {
     # Below 0.35 on purpose: only meaningful together with other signs.
     "throwaway_domain": 0.25,
     "filter_evasion": 0.15,
+    # "Verify/restore/re-KYC your account" + a link that is not an official domain. Enough
+    # for "suspicious" alone: genuine reminders point to the app, the branch or the bank's site.
+    "account_action_link": 0.5,
+    # account_blocked when the message gives no link, phone number or UPI ID (nothing to act
+    # on: genuine KYC reminders), or confirms the reader's own request ("as requested, your
+    # card has been blocked"). Its full weight is 0.45, in rules.py.
+    "account_blocked_weak": 0.2,
+    # "Your commission of Rs.150 has been added ... the next set of tasks".
+    "task_commission": 0.5,
 }
 # Signs that are common in ordinary promotions too (short links, odd spellings). When only
 # these fire, the rules score is capped at SUPPORTING_ONLY_MAX_SCORE, low enough that even a
@@ -29,6 +38,10 @@ RULE_WEIGHTS: dict[str, float] = {
 # with their full weight.
 SUPPORTING_RULES = frozenset({"short_url", "throwaway_domain", "filter_evasion"})
 SUPPORTING_ONLY_MAX_SCORE = 20
+# Signals whose evidence corroborates the classifier (see scoring.score). For "rules", only
+# hits outside SUPPORTING_RULES count. pattern_similarity and the LLM do not: they read the
+# same wording the classifier does.
+CORROBORATING_SIGNALS = frozenset({"rules", "url_intel", "upi_check", "reputation", "sender_check"})
 
 
 def _normalize_database_url(url: str) -> str:
@@ -142,14 +155,26 @@ class Settings(BaseSettings):
     CLASSIFIER_ENABLED: bool = True
     CLASSIFIER_MODEL_PATH: Path = BACKEND_DIR / "models" / "classifier.json"
     # Below this calibrated P(scam) the signal is listed but not counted, so it can raise a
-    # score but never pull the rules' evidence down. The lowest value (on the validation
-    # split) at which all 36 built-in examples keep their verdicts: the model still rates some
-    # genuine Indian bank/delivery alerts 0.7-0.9 (see ml/reports/private/*_classifier.md).
+    # score but never pull the rules' evidence down. Chosen in 2026-09 as the lowest value at
+    # which all 36 built-in examples keep their verdicts. The model retrained on 2026-10-19
+    # keeps them from 0.6, but 0.6 flags more genuine messages on val (10/905 vs 5/905) and
+    # polished_dev (3/20 vs 1/20), so it stays 0.9 (ml/eval_corroboration.py).
     CLASSIFIER_MIN_SCAM_PROBABILITY: float = 0.9
     # The classifier's weight is multiplied by this on a fraud-awareness notice ("X never asks
     # for your OTP", "report at 1930") with no link, UPI ID, phone number, amount or request
     # for money (rules.advisory_evidence): such notices share scams' vocabulary.
     CLASSIFIER_ADVISORY_WEIGHT_FACTOR: float = 0.5
+    # True: the classifier alone (no rule outside SUPPORTING_RULES and no url_intel, upi_check,
+    # reputation or sender_check evidence of at least CLASSIFIER_CORROBORATION_MIN) can raise
+    # the score but not to "suspicious" (scoring.score). Off: on val it un-flags 59 of 156
+    # Indian scams (most public scam reports have masked links, so the rules have nothing to
+    # add) and, after the 2026-10-19 retrain, no polished_dev false positive is the
+    # classifier's alone. See docs/EVALUATION.md, "Polished scams".
+    CLASSIFIER_REQUIRES_CORROBORATION: bool = False
+    # A rule hit of at least this weight, or a signal score of at least 100x this, corroborates.
+    CLASSIFIER_CORROBORATION_MIN: float = 0.3
+    # With corroboration on, a P(scam) at or above this counts without it (1.0: never).
+    CLASSIFIER_CORROBORATION_BYPASS: float = 1.0
 
     # Screenshots (app/services/ocr.py). Groq vision model first (needs GROQ_API_KEY; empty:
     # skipped), then the local OCR. qwen/qwen3.8-27b is the only vision-capable model on the

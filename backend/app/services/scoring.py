@@ -18,6 +18,12 @@ The opposite also exists: weak, supporting evidence (similarity to known scam pa
 `can_decide_scam=False`. It may nudge the score, but if the result is only a scam because of
 such signals, the score is capped just below the scam threshold.
 
+A signal can also need corroboration (`needs_corroboration`: the trained classifier, whose
+false positives are clean bank, refund and job messages). Unless another, independent signal
+(CORROBORATING_SIGNALS: a rule that is not supporting-only, url_intel, upi_check, reputation,
+sender_check) has evidence of at least `Thresholds.corroboration_min` of its own, such a
+signal may raise the score but not to "suspicious".
+
 The LLM ("llm" signal) gets the tightest limits, because it is the one layer the message
 itself can try to steer (prompt injection) and the one that can hallucinate:
 - Low weight in config (SIGNAL_WEIGHTS["llm"], 0.15 by default).
@@ -37,6 +43,7 @@ itself can try to steer (prompt injection) and the one that can hallucinate:
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 
+from app.core.config import CORROBORATING_SIGNALS, SUPPORTING_RULES
 from app.core.enums import ScamType, Severity, Verdict
 from app.schemas.analysis import RedFlag, Signal, SimilarPattern
 from app.services.rules import RuleResult
@@ -58,6 +65,8 @@ class SignalOutcome:
     # Multiplies the signal's configured weight for this message (e.g. 0.5: the classifier
     # on a fraud-awareness notice, see pipeline.classifier_step).
     weight_factor: float = 1.0
+    # True: alone (no corroborating signal, see score) it cannot make a result "suspicious".
+    needs_corroboration: bool = False
 
 
 @dataclass(frozen=True)
@@ -65,6 +74,9 @@ class Thresholds:
     suspicious_min: int = 35
     scam_min: int = 70
     strong_rule_weight: float = 0.8
+    # Evidence that corroborates a needs_corroboration signal: a non-supporting rule hit of at
+    # least this weight, or another corroborating signal scoring at least 100x this.
+    corroboration_min: float = 0.3
 
 
 @dataclass(frozen=True)
@@ -76,6 +88,7 @@ class ScoreResult:
     floor_source: str | None = None  # signal whose evidence floor set the score
     scam_capped: bool = False  # only supporting signals made it a scam, so it was capped
     ignored: tuple[str, ...] = ()  # signals left out for disagreeing with all the others
+    uncorroborated: tuple[str, ...] = ()  # needed corroboration, had none: capped
 
 
 def severity_for(weight: float) -> Severity:
@@ -155,6 +168,21 @@ def score(
     if top is not None:
         floor_source = top.source
         breakdown = _note(breakdown, top.source, f"sets the minimum score to {top.floor}")
+
+    # A signal that needs corroboration and has none may raise the score, but only up to
+    # just below "suspicious" (or to what the other signals score without it, if higher).
+    alone = [o.source for o in outcomes if o.needs_corroboration and _counts(o)]
+    uncorroborated: tuple[str, ...] = ()
+    if alone and not _corroborated(rule_result, outcomes, thresholds.corroboration_min):
+        uncorroborated = tuple(alone)
+        others = [o for o in outcomes if not o.needs_corroboration]
+        base, _ = combine_signals(others, weights)
+        base, _ = _apply_floor(base, others[1:])
+        cap = max(base, thresholds.suspicious_min - 1)
+        if risk_score > cap:
+            risk_score = cap
+            for source in alone:
+                breakdown = _note(breakdown, source, "capped: no other signal corroborates it")
     verdict = verdict_for(risk_score, thresholds)
 
     # Supporting-only signals (can_decide_scam=False) must not tip a result into "scam".
@@ -177,8 +205,33 @@ def score(
         risk_score, verdict, floor_applied = thresholds.suspicious_min, Verdict.SUSPICIOUS, True
 
     return ScoreResult(
-        risk_score, verdict, breakdown, floor_applied, floor_source, scam_capped, ignored
+        risk_score,
+        verdict,
+        breakdown,
+        floor_applied,
+        floor_source,
+        scam_capped,
+        ignored,
+        uncorroborated,
     )
+
+
+def _counts(o: SignalOutcome) -> bool:
+    return o.score is not None and o.informative
+
+
+def _corroborated(
+    rule_result: RuleResult, outcomes: Sequence[SignalOutcome], minimum: float
+) -> bool:
+    """Independent evidence: a rule that is not supporting-only (short link, odd spelling)
+    with at least `minimum` weight, or a corroborating signal scoring at least 100x that."""
+    if any(h.rule.id not in SUPPORTING_RULES and h.weight >= minimum for h in rule_result.hits):
+        return True
+    return any(
+        o.source in CORROBORATING_SIGNALS and o.source != "rules" and _counts(o)
+        and (o.score or 0) >= 100 * minimum
+        for o in outcomes
+    )  # fmt: skip
 
 
 def _drop_strong_disagreement(

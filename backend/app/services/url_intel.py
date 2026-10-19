@@ -33,37 +33,28 @@ from app.core.enums import ScamType
 from app.schemas.analysis import RedFlag
 from app.schemas.entities import ExtractedURL
 from app.services.cache import LookupCache
-from app.services.extractors import extract_urls
-from app.services.rules import RESTRICTED_SUFFIXES, SUSPICIOUS_TLDS, lookalike_brand
+from app.services.extractors import URL_SHORTENERS, extract_urls
+from app.services.rules import (
+    OFFICIAL_LINK_DOMAINS,
+    RESTRICTED_SUFFIXES,
+    SUSPICIOUS_TLDS,
+    lookalike_brand,
+)
 from app.services.scoring import SignalOutcome, severity_for
 
 logger = logging.getLogger(__name__)
 
-# Registered domains of banks, payment apps, regulators and big retailers. Hosting and
-# link platforms (google.com, amazonaws.com, t.me, ...) are deliberately absent: anyone can
-# put a page there.
-OFFICIAL_DOMAINS = frozenset(
-    {
-        # banks
-        "sbi.co.in", "onlinesbi.sbi", "onlinesbi.com", "sbicard.com", "hdfcbank.com",
-        "hdfc.com", "icicibank.com", "axisbank.com", "kotak.com", "pnbindia.in",
-        "netpnb.com", "bankofbaroda.in", "canarabank.com", "unionbankofindia.co.in",
-        "idfcfirstbank.com", "yesbank.in", "indusind.com", "federalbank.co.in",
-        # payments and regulators
-        "npci.org.in", "bhimupi.org.in", "rbi.org.in", "paytm.com", "paytm.in",
-        "phonepe.com", "amazonpay.in", "sebi.gov.in",
-        # government services
-        "indiapost.gov.in", "ippbonline.com", "parivahan.gov.in", "uidai.gov.in",
-        "incometax.gov.in", "cybercrime.gov.in", "india.gov.in", "irctc.co.in",
-        # shopping and delivery
-        "amazon.in", "amazon.com", "amzn.in", "flipkart.com", "myntra.com", "swiggy.com",
-        "zomato.com", "bluedart.com", "delhivery.com",
-    }
-)  # fmt: skip
+# Registered domains of banks, payment apps, regulators, big retailers and the brands' own
+# short-link domains (rules.OFFICIAL_LINK_DOMAINS, shared with the account_action_link rule).
+# Hosting and link platforms (google.com, amazonaws.com, t.me, ...) are deliberately absent:
+# anyone can put a page there.
+OFFICIAL_DOMAINS = OFFICIAL_LINK_DOMAINS
 
 MAX_HOPS = 5
 MAX_URLS = 5
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+# What a shortener answers for a link it has disabled (often after abuse reports) or never had.
+DISABLED_LINK_STATUSES = frozenset({404, 410})
 NEW_DOMAIN_DAYS = 30
 YOUNG_DOMAIN_DAYS = 180
 ESTABLISHED_DOMAIN_DAYS = 365
@@ -75,6 +66,8 @@ DNS_TIMEOUT_S = 2
 # Final-score floors for evidence that is decisive on its own (see scoring.py).
 SAFE_BROWSING_FLOOR = 90
 LOOKALIKE_CONFIRMED_FLOOR = 75
+# A shortened link hiding a site registered under NEW_DOMAIN_DAYS ago.
+SHORTENER_NEW_DOMAIN_FLOOR = 50
 
 
 @dataclass(frozen=True)
@@ -212,11 +205,16 @@ async def _probe(client: httpx.AsyncClient, url: str) -> tuple[int, str | None]:
         return resp.status_code, resp.headers.get("location")
 
 
-async def expand(client: httpx.AsyncClient, url: str, max_hops: int = MAX_HOPS) -> list[str]:
-    """Follow redirects from `url`. Returns the chain, starting with `url`."""
+async def expand_with_status(
+    client: httpx.AsyncClient, url: str, max_hops: int = MAX_HOPS
+) -> tuple[list[str], int | None]:
+    """Follow redirects from `url`: (the chain, starting with `url`; the HTTP status of its
+    last link, None if that one was not contacted)."""
     chain = [url]
+    status: int | None = None
     for _ in range(max_hops):
         current = chain[-1]
+        status = None
         if not _is_public_http(current):
             break
         if not await _resolves_to_public(urlsplit(current).hostname or ""):
@@ -225,7 +223,13 @@ async def expand(client: httpx.AsyncClient, url: str, max_hops: int = MAX_HOPS) 
         if status not in REDIRECT_STATUSES or not location:
             break
         chain.append(urljoin(current, location.strip()))
-    return chain
+        status = None
+    return chain, status
+
+
+async def expand(client: httpx.AsyncClient, url: str, max_hops: int = MAX_HOPS) -> list[str]:
+    """Follow redirects from `url`. Returns the chain, starting with `url`."""
+    return (await expand_with_status(client, url, max_hops))[0]
 
 
 def registration_date(rdap: dict[str, Any]) -> date | None:
@@ -319,6 +323,7 @@ async def check_url(
         return report
 
     # 1. Expand shortened links.
+    last_status: int | None = None
     if url.is_shortener:
         try:
             async with asyncio.timeout(timeout):
@@ -326,6 +331,7 @@ async def check_url(
                     cache, f"expand:{url.url}", lambda: _expand_json(client, url.url)
                 )
             report.chain = data["chain"]
+            last_status = data.get("status")  # missing in entries cached before it existed
         except Exception as exc:  # fail soft
             report.unavailable.append(f"link expansion: {_reason(exc)}")
 
@@ -340,7 +346,18 @@ async def check_url(
         report.allowlisted = True
         return report
 
+    # A shortener's own domain is old and clean: its age says nothing about the link.
+    final_is_shortener = final.registered_domain in URL_SHORTENERS or final.host in URL_SHORTENERS
+
     # 2. Static checks on the final domain.
+    if url.is_shortener and not redirected and last_status in DISABLED_LINK_STATUSES:
+        report.findings.append(Finding(
+            "url_short_link_disabled", 0.3,
+            "The shortener has disabled this link, which often happens after abuse reports",
+            "छोटा लिंक बंद कर दिया गया है, जो अक्सर धोखाधड़ी की शिकायतों के बाद होता है",
+            f"{url.url}: HTTP {last_status}",
+            f"link disabled by the shortener (HTTP {last_status})",
+        ))  # fmt: skip
     if redirected and url.is_shortener:
         report.findings.append(Finding(
             "url_shortener_redirect", 0.3,
@@ -368,7 +385,7 @@ async def check_url(
 
     # 3. Network checks on the final domain, in parallel.
     async def age() -> None:
-        if final.is_ip:
+        if final.is_ip or final_is_shortener:
             return
         try:
             async with asyncio.timeout(timeout):
@@ -441,11 +458,15 @@ async def check_url(
     elif "url_lookalike" in codes and codes & {"url_new_domain", "url_shortener_redirect"}:
         # A brand lookalike that is days old, or hidden behind a shortener.
         report.floor = LOOKALIKE_CONFIRMED_FLOOR
+    elif {"url_new_domain", "url_shortener_redirect"} <= codes:
+        # A shortener hiding a days-old site: no genuine brand link looks like that.
+        report.floor = SHORTENER_NEW_DOMAIN_FLOOR
     return report
 
 
 async def _expand_json(client: httpx.AsyncClient, url: str) -> dict[str, Any]:
-    return {"chain": await expand(client, url)}
+    chain, status = await expand_with_status(client, url)
+    return {"chain": chain, "status": status}
 
 
 # --------------------------------------------------------------------------- signal

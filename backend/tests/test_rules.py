@@ -1,5 +1,6 @@
 import pytest
 
+from app.core.config import RULE_WEIGHTS
 from app.core.enums import ScamType
 from app.services.extractors import extract_entities
 from app.services.rules import (
@@ -93,6 +94,10 @@ CASES: dict[str, tuple[str, str]] = {
         "Your SBI account will be blocked today",
         "Your SBI account statement is ready",
     ),
+    "account_action_link": (
+        "Your wallet has been restricted. Restore access here: rb.gy/k9x2",
+        "Your wallet KYC is due. Complete it at paytm.com or in the Paytm app",
+    ),
     "electricity_disconnection": (
         "Your electricity will be disconnected tonight",
         "Power cut scheduled tomorrow 10am-2pm for maintenance -BSES",
@@ -120,6 +125,10 @@ CASES: dict[str, tuple[str, str]] = {
     "prepaid_task": (
         "Recharge ₹500 to unlock the next task",
         "Complete the next task in your course",
+    ),
+    "task_commission": (
+        "Your commission of Rs.150 is added. Continue to the next set of tasks on our portal",
+        "Your agent commission for September has been credited to your bank account",
     ),
     "remote_access_app": (
         "Please install AnyDesk for verification",
@@ -237,6 +246,108 @@ def test_credential_requests_hinglish_devanagari(text: str) -> None:
 )
 def test_lookalike_domains(host: str, flagged: bool) -> None:
     assert (fires("lookalike_domain", f"open https://{host}/x") is not None) is flagged
+
+
+@pytest.mark.parametrize(
+    ("host", "flagged"),
+    [
+        ("bob-card-services.in", True),
+        ("bobby-fashion.com", False),  # "bob" only as a whole token
+        ("bankofbaroda.in", False),
+        ("bank0fbaroda-kyc.com", True),
+        ("dtdc-track-delivery.in", True),
+        ("dtdc.in", False),
+        ("incometax-refund-status.in", True),
+        ("msedcl-bill-pay.in", True),
+        ("wss.mahadiscom.in", False),
+        ("hdfcbk.io", False),  # HDFC Bank's own short domain
+        ("zoma.to", False),
+    ],
+)
+def test_lookalike_domains_of_added_brands(host: str, flagged: bool) -> None:
+    assert (fires("lookalike_domain", f"open https://{host}/x") is not None) is flagged
+
+
+def _hit(rule_id: str, text: str):  # noqa: ANN202
+    hits = evaluate(extract_entities(text), [RULES_BY_ID[rule_id]]).hits
+    return hits[0] if hits else None
+
+
+WEAK = RULE_WEIGHTS["account_blocked_weak"]
+
+
+@pytest.mark.parametrize(
+    ("text", "weight"),
+    [
+        ("Your SBI account will be blocked today. Update KYC: sbi-kyc.in", 0.45),
+        ("Call 99999 12345 or your SBI account will be blocked today", 0.45),
+        # nothing to act on: a genuine KYC reminder looks like this
+        ("Your KYC is pending. Complete it in the app or at any branch", WEAK),
+        ("As requested, your debit card has been blocked. Call 1860 419 5555", WEAK),
+        ("आपके अनुरोध पर आपका खाता ब्लॉक कर दिया गया है। 1800 1234", WEAK),
+    ],
+)  # fmt: skip
+def test_account_blocked_weight_needs_a_way_to_act(text: str, weight: float) -> None:
+    hit = _hit("account_blocked", text)
+    assert hit is not None and hit.weight == weight
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Bank of Baroda: your debit card is on hold. Reactivate it at bob-card-services.in",
+        "प्रिय ग्राहक, आपकी नेट बैंकिंग सेवा रोक दी गई है। यहां लॉग इन करें: tinyurl.com/nb-seva",
+        "Aapke ICICI account ka KYC renewal baaki hai, yahan update karein: tinyurl.com/x-kyc",
+    ],
+)
+def test_account_action_link(text: str) -> None:
+    assert fires("account_action_link", text) is not None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Your KYC is due. Update it at https://www.onlinesbi.sbi or in YONO",
+        "Verify your account at echallan.parivahan.gov.in",
+        "Your order is out for delivery. Track: amzn.in/d/8xKp2Qr",  # no account action
+        "HDFC Bank: your card statement is ready. View: hdfcbk.io/HDFCBK/s/aQ9x2",
+    ],
+)
+def test_account_action_link_not_for_official_or_unrelated_links(text: str) -> None:
+    assert fires("account_action_link", text) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "We have a remote role rating hotels, paying Rs.2,000 to Rs.5,000 per day",
+        "ऑनलाइन रिव्यू देकर आप रोज़ ₹2,000 तक कमा सकते हैं",
+        "Sirf videos like karke roz Rs.1,500 kama sakte hain",
+    ],
+)
+def test_earn_per_task_pay_rates(text: str) -> None:
+    assert fires("earn_per_task", text) is not None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Thank you for paying Rs.500 for your daily milk subscription",
+        "रोज़ नए कमाल के ऑफर देखें",  # "कमाल" (amazing) is not "कमा" (earn)
+    ],
+)
+def test_earn_per_task_not_ordinary_wording(text: str) -> None:
+    assert fires("earn_per_task", text) is None
+
+
+def test_messaging_link_job_in_hindi() -> None:
+    text = "हमारी कंपनी लोगों को नियुक्त कर रही है। टेलीग्राम पर संपर्क करें: t.me/reviewdesk_hr"
+    assert fires("messaging_link_job", text) is not None
+
+
+def test_relationship_manager_is_a_care_role() -> None:
+    text = "SBI Card: hamare relationship manager se baat karein: 99999 46381"
+    assert fires("helpline_personal_mobile", text) is not None
 
 
 def test_saturating_score() -> None:
@@ -456,7 +567,9 @@ def test_short_url_alone_stays_below_suspicious() -> None:
     assert [h.rule.id for h in alone.hits] == ["short_url"] and alone.supporting_only
     assert alone.score == 20 and 0.857 * alone.score + 0.143 * 100 < 35
     both = evaluate(extract_entities("Your account will be blocked. Update at bit.ly/4QxRt7z"))
-    assert both.score == saturating_score([0.45, 0.45]) and not both.supporting_only
+    # account_blocked, short_url, and account_action_link (account action + unofficial link)
+    weights = [0.45, 0.45, RULE_WEIGHTS["account_action_link"]]
+    assert both.score == saturating_score(weights) and not both.supporting_only
 
 
 def test_supporting_signs_together_stay_capped() -> None:

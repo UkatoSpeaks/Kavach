@@ -80,7 +80,7 @@ BARE_DOMAIN_TLDS = frozenset(
         "bank", "pro", "sbs", "cfd", "bond", "lol", "rest", "quest", "page", "one",
         # ccTLDs used by shorteners
         "ly", "gl", "gd", "at", "cc", "us", "uk", "cn", "ru", "id", "li", "fr", "de", "su",
-        "ws", "sh", "gg", "do", "st", "ink",
+        "ws", "sh", "gg", "do", "st", "ink", "gy", "to", "it",  # rb.gy, zoma.to, fkrt.it
     }
 )  # fmt: skip
 # Bare-domain TLDs that are also everyday English words. "Quiz.Win a prize" or "Reached
@@ -90,7 +90,7 @@ WORD_TLDS = frozenset(
         "in", "me", "at", "do", "us", "one", "win", "today", "live", "life", "shop", "store",
         "club", "fun", "work", "help", "world", "news", "money", "bank", "page", "link",
         "click", "online", "site", "space", "support", "services", "digital", "cloud", "loan",
-        "bid", "rest", "quest", "bond", "pro", "tech", "website",
+        "bid", "rest", "quest", "bond", "pro", "tech", "website", "to", "it",
     }
 )  # fmt: skip
 

@@ -18,7 +18,8 @@ from app.core.config import RULE_WEIGHTS, SUPPORTING_ONLY_MAX_SCORE, SUPPORTING_
 from app.core.enums import ScamType
 from app.schemas.entities import ExtractedEntities, ExtractedURL
 
-Check = Callable[[str, ExtractedEntities], str | None]
+# Evidence, or (evidence, weight) when this message warrants a lower weight than the rule's.
+Check = Callable[[str, ExtractedEntities], str | tuple[str, float] | None]
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,11 @@ class Rule:
 class RuleHit:
     rule: Rule
     evidence: str
+    weight_override: float | None = None  # set when the check lowered the weight
+
+    @property
+    def weight(self) -> float:
+        return self.rule.weight if self.weight_override is None else self.weight_override
 
 
 @dataclass(frozen=True)
@@ -47,7 +53,7 @@ class RuleResult:
 
     @property
     def max_weight(self) -> float:
-        return max((h.rule.weight for h in self.hits), default=0.0)
+        return max((h.weight for h in self.hits), default=0.0)
 
 
 # =========================================================================== phrase lists
@@ -116,6 +122,28 @@ ACCOUNT_BLOCKED = [
     r"खाता(?:\s+\S+){0,3}?\s+(?:बंद|ब्लॉक|निलंबित)",
     r"केवाईसी(?:\s+\S+){0,3}?\s+(?:समाप्त|अपडेट|लंबित)",
 ]  # fmt: skip
+# "As requested, your card has been blocked": a confirmation, not a threat.
+AS_REQUESTED = [
+    r"\bas (?:per your |you )?request(?:ed)?\b", r"\b(?:on|at|per) your request\b",
+    r"\b(?:aapke|aapki|apke|apki) (?:anurodh|request|nivedan) (?:par|pe)\b",
+    "आपके अनुरोध पर", "आपके निवेदन पर", "आपकी रिक्वेस्ट पर",
+]  # fmt: skip
+# Something to do to an account (verify it, restore it, finish its KYC) ...
+ACCOUNT_ACTION = [
+    r"\bre-?kyc\b", r"\bv?-?kyc\b", r"\bverif(?:y|ied|ication)\b", r"\brestor(?:e|ed)\b",
+    r"\bre-?activat\w*", r"\bon hold\b", r"\brestrict(?:ed|ion)\b", r"\bsuspen(?:d|ded|sion)\b",
+    r"\bblocked\b", r"\bdeactivat\w*", r"\bfrozen\b", r"\bunblock\w*", r"\bchalu kar\w*",
+    r"\bband kar (?:diya|di)\b",
+    "केवाईसी", "सत्यापित", "रोक दी", "रोका गया", "फिर से शुरू", "बंद कर दिया", "बंद कर दी",
+    "निलंबित", "चालू कर",
+]  # fmt: skip
+# ... named next to the account, card or service it applies to.
+ACCOUNT_NOUNS = [
+    r"\baccount\b", r"\ba/c\b", r"\bacct\b", r"\bcard\b", r"\bwallet\b", r"\bv?-?kyc\b",
+    r"\bnet ?banking\b", r"\bmobile banking\b", r"\byono\b", r"\bupi\b", r"\bprofile\b",
+    r"\bkhat[ae]\b", r"\bbanking services?\b",
+    "खाता", "खाते", "केवाईसी", "बैंकिंग", "कार्ड", "वॉलेट",
+]  # fmt: skip
 ELECTRICITY = [
     r"\belectricity\b", r"\bbijli\b", r"\bpower (?:supply|connection)\b",
     r"\belectric (?:connection|supply)\b", r"\bbses\b", r"\btata power\b",
@@ -159,8 +187,13 @@ CONSEQUENCE = [
 ]  # fmt: skip
 EARN = [
     r"\bearn\w*", r"\bincome\b", r"\bsalary\b", r"\bpayout\b", r"\bkamai\b",
-    r"\bkama(?:o|ye|yein|ein|iye)\b", r"\bpaise kamaye?",
+    r"\bkama(?:o|ye|yein|ein|iye)\b", r"\bpaise kamaye?", r"\bkama (?:sakte|sakti|lo|lijiye)\b",
+    # "paying Rs.2,000 to Rs.5,000 per day": a pay rate, not "thanks for paying Rs.500"
+    r"\b(?:paying|pays|pay you)\s+(?:up ?to\s+|between\s+)?(?:rs\.?|₹|inr)\s?[\d,]+"
+    r"(?:\s*(?:to|-)\s*(?:rs\.?|₹|inr)?\s?[\d,]+)?\s*(?:per|a|/)\s*(?:day|task|hour|review)\b",
     "कमाएं", "कमाई", "कमाइए", "कमाओ", "कमाए",
+    # "कमा सकते हैं" (can earn); not "कमाल" (amazing)
+    r"कमा(?=\s|$|ने|ना|ते|ती|या|यें)",
 ]  # fmt: skip
 PER_TASK = [
     r"\bper (?:day|like|review|task|video|hour|rating|order)\b", r"\bdaily\b", r"/day\b",
@@ -176,7 +209,7 @@ PART_TIME = [
 JOB_WORDS = [
     r"\bjobs?\b", r"\bhiring\b", r"\btasks?\b", r"\bpart[\s-]?time\b", r"\bearn\w*",
     r"\bsalary\b", r"\bhr\b", r"\bnaukri\b", r"\bvacanc(?:y|ies)\b", r"\brecruit\w*",
-    r"\bwork from home\b", "नौकरी", "भर्ती",
+    r"\bwork from home\b", "नौकरी", "भर्ती", "नियुक्त", "रिव्यू", "घर से काम", "पार्ट टाइम",
 ]  # fmt: skip
 PREPAID_TASK = [
     r"\bprepaid tasks?\b", r"\b(?:recharge|deposit|pay|invest)\w* (?:\S+ ){0,4}?to unlock\b",
@@ -184,10 +217,18 @@ PREPAID_TASK = [
     r"\bmerchant tasks?\b", r"\bvip tasks?\b", r"\btask (?:unlock|recharge)\b",
     r"\bcommission (?:task|order)s?\b",
 ]  # fmt: skip
+# "Your commission of Rs.150 has been added. To continue to the next set of tasks ...": the
+# small first payout of a task scam, before the deposits start.
+COMMISSION = [r"\bcommissions?\b", r"\bkamishan\b", "कमीशन"]
+TASK_STEP = [
+    r"\btrial tasks?\b", r"\bnext (?:set|round|batch|level) of tasks?\b", r"\bnext tasks?\b",
+    r"\btasks? (?:completed|done|pura)\b", r"\bcomplet\w* (?:the |your |all )?(?:\w+ )?tasks?\b",
+    "अगला टास्क", "टास्क पूरा",
+]  # fmt: skip
 CARE_WORDS = [
     r"\bcustomer (?:care|support|service)\b", r"\bhelp ?line\b", r"\bhelp ?desk\b",
     r"\btoll[\s-]?free\b", r"\brefund\w*", r"\bcomplaint\b", r"\bofficer\b", r"\bexecutive\b",
-    r"\badhikari\b", r"\bsampark\b", r"\bsupport team\b",
+    r"\badhikari\b", r"\bsampark\b", r"\bsupport team\b", r"\brelationship manager\b",
     "कस्टमर केयर", "हेल्पलाइन", "शिकायत", "रिफंड", "अधिकारी",
 ]  # fmt: skip
 CREDENTIALS = [
@@ -276,11 +317,15 @@ BRAND_OFFICIAL_DOMAINS: dict[str, frozenset[str]] = {
                 "sbimf.com", "sbigeneral.in", "sbisecurities.in", "yonobusiness.sbi"},
         "yono": {"sbi.co.in", "onlinesbi.sbi", "yonobusiness.sbi", "sbiyono.sbi"},
         "hdfc": {"hdfcbank.com", "hdfc.com", "hdfclife.com", "hdfcergo.com", "hdfcsec.com",
-                 "hdfcfund.com", "hdfcbank.net"},
+                 "hdfcfund.com", "hdfcbank.net", "hdfcbk.io"},
         "icici": {"icicibank.com", "icicidirect.com", "iciciprulife.com", "icicilombard.com"},
         "axis": {"axisbank.com", "axisdirect.in", "axismf.com"},
         "kotak": {"kotak.com", "kotaksecurities.com", "kotakmf.com", "kotaklife.com"},
         "pnb": {"pnbindia.in", "netpnb.com", "pnbcard.in"},
+        "bankofbaroda": {"bankofbaroda.in", "bankofbaroda.com", "bankofbaroda.co.in",
+                         "bobibanking.com", "bobcard.co.in", "bobfinancial.com"},
+        "bob": {"bankofbaroda.in", "bankofbaroda.com", "bankofbaroda.co.in", "bobibanking.com",
+                "bobcard.co.in", "bobfinancial.com"},
         "paytm": {"paytm.com", "paytm.in", "paytmbank.com", "paytmmoney.com", "paytm.me"},
         "phonepe": {"phonepe.com"},
         "gpay": {"google.com", "goo.gl"},
@@ -289,23 +334,41 @@ BRAND_OFFICIAL_DOMAINS: dict[str, frozenset[str]] = {
         "bhim": {"bhimupi.org.in", "npci.org.in"},
         "rbi": {"rbi.org.in"},
         "indiapost": {"indiapost.gov.in", "ippbonline.com"},
+        "incometax": {"incometax.gov.in", "incometaxindia.gov.in"},
+        "speedpost": {"indiapost.gov.in"},
         "bses": {"bsesdelhi.com"},
+        "msedcl": {"mahadiscom.in"},
+        "mahadiscom": {"mahadiscom.in"},
         "tatapower": {"tatapower.com", "tatapower-ddl.com"},
         "parivahan": {"parivahan.gov.in"},
         "echallan": {"parivahan.gov.in"},
         "amazon": {"amazon.in", "amazon.com", "amzn.in", "amzn.to", "amazonaws.com",
                    "amazonpay.in", "media-amazon.com"},
         "flipkart": {"flipkart.com", "fkrt.it", "fkrt.co"},
+        "zomato": {"zomato.com", "zoma.to"},
         "bluedart": {"bluedart.com"},
         "delhivery": {"delhivery.com"},
+        "dtdc": {"dtdc.in", "dtdc.com"},
         "fedex": {"fedex.com"},
     }.items()
 }  # fmt: skip
 _OFFICIAL_DOMAINS = frozenset().union(*BRAND_OFFICIAL_DOMAINS.values())
 # Brands that are also ordinary words one typo away ("delivery") only match exactly.
 NO_FUZZY_BRANDS = frozenset({"delhivery"})
+# Short brands that begin ordinary words ("bob" -> "bobby"): a whole host token, not a prefix.
+WHOLE_TOKEN_BRANDS = frozenset({"bob"})
 # Only government bodies / banks can register these, so they are never lookalikes.
 RESTRICTED_SUFFIXES = (".gov.in", ".nic.in", ".bank.in", ".fin.in", ".mil.in", ".sbi")
+# Links to an organisation's own site: the brands' domains above, minus platforms where
+# anyone can host a page (sites.google.com, an S3 bucket), plus banks, retailers and services
+# not imitated often enough to be a brand above. url_intel allowlists these too.
+_HOSTING_DOMAINS = frozenset({"google.com", "goo.gl", "amazonaws.com", "media-amazon.com"})
+OFFICIAL_LINK_DOMAINS = (_OFFICIAL_DOMAINS - _HOSTING_DOMAINS) | frozenset(
+    {
+        "canarabank.com", "unionbankofindia.co.in", "idfcfirstbank.com", "yesbank.in",
+        "indusind.com", "federalbank.co.in", "irctc.co.in", "myntra.com", "swiggy.com",
+    }
+)  # fmt: skip
 
 
 # =========================================================================== helpers
@@ -406,7 +469,9 @@ def _brand_in_host(host: str, suffix_labels: int) -> str | None:
         for token in _fold(raw_token):
             for brand in BRAND_OFFICIAL_DOMAINS:
                 if len(brand) <= 4:  # short brands (sbi, rbi, axis): whole token or prefix
-                    if token == brand or token.startswith(brand):
+                    if token == brand or (
+                        token.startswith(brand) and brand not in WHOLE_TOKEN_BRANDS
+                    ):
                         return brand
                 elif brand in token or (
                     brand not in NO_FUZZY_BRANDS
@@ -436,6 +501,17 @@ def _all_links_official(entities: ExtractedEntities) -> bool:
         or any(u.registered_domain in d for d in BRAND_OFFICIAL_DOMAINS.values())
         for u in entities.urls
     )
+
+
+def is_official_link(url: ExtractedURL) -> bool:
+    return url.registered_domain in OFFICIAL_LINK_DOMAINS or ("." + url.registered_domain).endswith(
+        RESTRICTED_SUFFIXES
+    )
+
+
+def _contact_route(entities: ExtractedEntities) -> bool:
+    """A link, phone number or UPI ID: a way for a scam to reach its victim."""
+    return bool(entities.urls or entities.phones or _has_upi(entities))
 
 
 def _mobile_numbers(entities: ExtractedEntities) -> list[str]:
@@ -547,8 +623,23 @@ def _suspicious_tld(text: str, e: ExtractedEntities) -> str | None:
     return next((u.raw for u in e.urls if _tld(u) in SUSPICIOUS_TLDS), None)
 
 
-def _account_blocked(text: str, e: ExtractedEntities) -> str | None:
-    return _find(text, ACCOUNT_BLOCKED)
+def _account_blocked(text: str, e: ExtractedEntities) -> str | tuple[str, float] | None:
+    """Full weight only when the message also gives a way to act on the threat (a link,
+    phone number or UPI ID) and does not confirm the reader's own request."""
+    hit = _find(text, ACCOUNT_BLOCKED)
+    if hit and (not _contact_route(e) or _find(text, AS_REQUESTED)):
+        return hit, RULE_WEIGHTS["account_blocked_weak"]
+    return hit
+
+
+def _account_action_link(text: str, e: ExtractedEntities) -> str | None:
+    """Verify / restore / complete the KYC of an account, plus a link to a site that is not
+    the bank's or the service's own. Genuine reminders send you to the app or branch."""
+    link = next((u for u in e.urls if not is_official_link(u)), None)
+    if link is None:
+        return None
+    hit = _near(text, ACCOUNT_ACTION, ACCOUNT_NOUNS, window=2)
+    return _snippet(f"{hit} … {link.raw}") if hit else None
 
 
 def _electricity_disconnection(text: str, e: ExtractedEntities) -> str | None:
@@ -586,6 +677,10 @@ def _messaging_link_job(text: str, e: ExtractedEntities) -> str | None:
 
 def _prepaid_task(text: str, e: ExtractedEntities) -> str | None:
     return _find(text, PREPAID_TASK)
+
+
+def _task_commission(text: str, e: ExtractedEntities) -> str | None:
+    return _near(text, COMMISSION, TASK_STEP, window=2)
 
 
 def _remote_access_app(text: str, e: ExtractedEntities) -> str | None:
@@ -718,6 +813,11 @@ RULES: tuple[Rule, ...] = (
     Rule("account_blocked", "Threatens that your account, card or KYC is blocked or expiring",
          "खाता, कार्ड या KYC बंद होने की धमकी दी गई है", T.PHISHING_LINK, 0.45,
          _account_blocked),
+    Rule("account_action_link",
+         "Asks you to verify, restore or update your account through a link that is not the "
+         "official website",
+         "खाता वेरिफ़ाई, चालू या KYC अपडेट करने के लिए ऐसा लिंक दिया गया है जो आधिकारिक वेबसाइट "
+         "नहीं है", T.PHISHING_LINK, RULE_WEIGHTS["account_action_link"], _account_action_link),
     Rule("electricity_disconnection", "Threatens to disconnect your electricity",
          "बिजली कनेक्शन काटने की धमकी दी गई है", T.PHISHING_LINK, 0.55,
          _electricity_disconnection),
@@ -739,6 +839,9 @@ RULES: tuple[Rule, ...] = (
     Rule("prepaid_task", "Asks you to pay or recharge to unlock tasks or earnings",
          "टास्क या कमाई अनलॉक करने के लिए पैसे जमा करने को कहा गया है", T.TASK_JOB, 0.75,
          _prepaid_task),
+    Rule("task_commission", "Pays a 'commission' for online tasks and offers the next set",
+         "ऑनलाइन टास्क के लिए 'कमीशन' और अगले टास्क का लालच दिया गया है", T.TASK_JOB,
+         RULE_WEIGHTS["task_commission"], _task_commission),
     # --- fake customer care
     Rule("remote_access_app", "Asks you to install a screen-sharing app",
          "स्क्रीन शेयर करने वाला ऐप (जैसे AnyDesk) इंस्टॉल करने को कहा गया है",
@@ -802,21 +905,22 @@ def evaluate(entities: ExtractedEntities, rules: Iterable[Rule] = RULES) -> Rule
     for text in texts:  # the 1->l copy only adds rules the 1->i copy missed
         for rule in rules:
             if rule.id not in found and (evidence := rule.check(text, entities)) is not None:
-                found[rule.id] = RuleHit(rule, _unfold(evidence, text, original))
+                evidence, weight = evidence if isinstance(evidence, tuple) else (evidence, None)
+                found[rule.id] = RuleHit(rule, _unfold(evidence, text, original), weight)
     hits = [found[r.id] for r in rules if r.id in found]
-    hits.sort(key=lambda h: h.rule.weight, reverse=True)
+    hits.sort(key=lambda h: h.weight, reverse=True)
 
     type_weights: dict[ScamType, float] = {}
     for hit in hits:
         t = hit.rule.scam_type
-        type_weights[t] = round(type_weights.get(t, 0.0) + hit.rule.weight, 4)
+        type_weights[t] = round(type_weights.get(t, 0.0) + hit.weight, 4)
 
     # Generic signs (an OTP request) fit every type; only use GENERIC if nothing else fired.
     specific = {t: w for t, w in type_weights.items() if t is not ScamType.GENERIC}
     pool = specific or type_weights
     scam_type = max(pool, key=lambda t: (pool[t], _max_weight(hits, t))) if pool else None
 
-    score = saturating_score(h.rule.weight for h in hits)
+    score = saturating_score(h.weight for h in hits)
     supporting_only = bool(hits) and all(h.rule.id in SUPPORTING_RULES for h in hits)
     if supporting_only:
         score = min(score, SUPPORTING_ONLY_MAX_SCORE)
@@ -830,7 +934,7 @@ def evaluate(entities: ExtractedEntities, rules: Iterable[Rule] = RULES) -> Rule
 
 
 def _max_weight(hits: list[RuleHit], scam_type: ScamType) -> float:
-    return max(h.rule.weight for h in hits if h.rule.scam_type is scam_type)
+    return max(h.weight for h in hits if h.rule.scam_type is scam_type)
 
 
 # =========================================================================== advisories

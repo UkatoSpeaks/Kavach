@@ -85,6 +85,7 @@ def thresholds_from(settings: Settings) -> scoring.Thresholds:
         suspicious_min=settings.VERDICT_SUSPICIOUS_MIN,
         scam_min=settings.VERDICT_SCAM_MIN,
         strong_rule_weight=settings.STRONG_RULE_WEIGHT,
+        corroboration_min=settings.CLASSIFIER_CORROBORATION_MIN,
     )
 
 
@@ -100,7 +101,7 @@ def red_flags(hits: list[rules.RuleHit]) -> list[RedFlag]:
             code=h.rule.id,
             message=h.rule.description_en,
             message_hi=h.rule.description_hi,
-            severity=severity_for(h.rule.weight),
+            severity=severity_for(h.weight),
             evidence=h.evidence,
         )
         for h in hits
@@ -221,7 +222,8 @@ def classifier_step(
     """The trained classifier's signal (pure, in-process, a few ms). Only for message text:
     a bare URL/UPI ID/QR payload is nothing like what it was trained on. On a fraud-awareness
     notice (rules.advisory_evidence) its weight is scaled down by
-    CLASSIFIER_ADVISORY_WEIGHT_FACTOR. Fails soft."""
+    CLASSIFIER_ADVISORY_WEIGHT_FACTOR; with CLASSIFIER_REQUIRES_CORROBORATION it cannot make a
+    message suspicious alone (scoring.score). Fails soft."""
     if not message_text or not settings.CLASSIFIER_ENABLED:
         return []
     start = time.perf_counter()
@@ -229,6 +231,9 @@ def classifier_step(
         model = classifier.get_classifier(settings.CLASSIFIER_MODEL_PATH)
         threshold = settings.CLASSIFIER_MIN_SCAM_PROBABILITY
         outcome = classifier.classifier_signal(text, model, threshold)
+        bypass = settings.CLASSIFIER_CORROBORATION_BYPASS
+        if settings.CLASSIFIER_REQUIRES_CORROBORATION and (outcome.score or 0) < 100 * bypass:
+            outcome = replace(outcome, needs_corroboration=True)
         factor = settings.CLASSIFIER_ADVISORY_WEIGHT_FACTOR
         if outcome.score is not None and factor != 1 and (cue := rules.advisory_evidence(entities)):
             outcome = replace(

@@ -14,8 +14,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import UrlCache
 from app.services import url_intel
+from app.services.cache import LookupCache
+from app.services.extractors import extract_urls
 from app.services.url_intel import SAFE_BROWSING_URL, expand, is_official, registration_date
-from tests.conftest import ClientFactory
+from ml.mock_network import MockNetwork
+from tests.conftest import ClientFactory, settings_for_tests
 
 RDAP = "https://rdap.org/domain/{}"
 
@@ -383,7 +386,8 @@ async def test_slow_dns_is_cut_off(monkeypatch: pytest.MonkeyPatch) -> None:
     [("sbi.co.in", True), ("onlinesbi.sbi", True), ("npci.org.in", True),
      ("echallan.parivahan.gov.in", True), ("icici.bank.in", True), ("flipkart.com", True),
      ("sbi-kyc.co.in", False), ("amazonaws.com", False), ("google.com", False),
-     ("gov.in.evil.com", False)],
+     ("gov.in.evil.com", False), ("hdfcbk.io", True), ("zoma.to", True), ("fkrt.it", True),
+     ("dtdc.in", True), ("mahadiscom.in", True), ("bankofbaroda.in", True)],
 )  # fmt: skip
 def test_is_official(domain: str, official: bool) -> None:
     assert is_official(domain) is official
@@ -397,3 +401,42 @@ def test_registration_date() -> None:
     assert registration_date({}) is None
     bad = {"events": [{"eventAction": "registration", "eventDate": "not a date"}]}
     assert registration_date(bad) is None
+
+
+async def _check(
+    link: str, domains: dict, redirects: dict
+) -> tuple[url_intel.UrlReport, MockNetwork]:
+    mock = MockNetwork(domains, redirects)
+    async with mock.client() as client:
+        (url,) = extract_urls(link)
+        report = await url_intel.check_url(
+            url, client=client, cache=LookupCache(None, timedelta(hours=1)),
+            settings=settings_for_tests(),
+        )  # fmt: skip
+    return report, mock
+
+
+async def test_disabled_short_link_is_a_mild_warning_and_skips_rdap() -> None:
+    report, mock = await _check("bit.ly/gone-link", {}, {"bit.ly/gone-link": 404})
+    assert [f.code for f in report.findings] == ["url_short_link_disabled"]
+    assert report.score == 30 and report.floor is None
+    # The shortener's own (old) domain age says nothing about the link: not looked up.
+    assert not any(k.startswith("rdap:") for k in mock.unknown) and report.registered is None
+    assert "no issues found" not in url_intel._describe(report)
+
+
+async def test_shortener_hiding_a_new_domain_sets_a_floor() -> None:
+    report, _ = await _check(
+        "tinyurl.com/pay-bill", {"quick-billpay.in": {"age_days": 5}},
+        {"tinyurl.com/pay-bill": "https://quick-billpay.in/pay"},
+    )  # fmt: skip
+    assert {f.code for f in report.findings} == {"url_shortener_redirect", "url_new_domain"}
+    assert report.floor == url_intel.SHORTENER_NEW_DOMAIN_FLOOR
+
+
+async def test_shortener_to_young_domain_has_no_floor() -> None:
+    report, _ = await _check(
+        "tinyurl.com/shop", {"new-shop.in": {"age_days": 90}},
+        {"tinyurl.com/shop": "https://new-shop.in/"},
+    )  # fmt: skip
+    assert report.floor is None
