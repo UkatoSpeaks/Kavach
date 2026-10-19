@@ -34,7 +34,7 @@ from app.services.rules import (
     lookalike_brand,
 )
 
-FEATURES_VERSION = 2
+FEATURES_VERSION = 3
 
 CHAR_NGRAMS = (2, 5)
 WORD_NGRAMS = (1, 2)

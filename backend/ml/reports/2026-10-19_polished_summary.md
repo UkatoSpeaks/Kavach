@@ -1,5 +1,11 @@
 # Polished scams: results, misses and proposed fixes (2026-10-19)
 
+> **Superseded.** This is the analysis *before* the fixes. Fixes 1, 2, 3 (as a mild 0.3
+> warning), 4, 9 (relationship manager only), 10 and part of 8 were implemented later the
+> same day, the classifier was retrained (12), and the set was split into dev/test halves.
+> Results: [docs/EVALUATION.md](../../../docs/EVALUATION.md#polished-scams-2026-10-19) and
+> `2026-10-19_polished_test_{before,after}_{offline,mocknet}.md`.
+
 Set: `data/datasets/polished_eval.csv`: 40 polished scams and 40 clean genuine messages,
 synthetic (hand-written by Claude) and evaluation only. Network fixture:
 `data/datasets/polished_eval_network.json`. Detailed reports: `2026-10-19_polished_offline.md`,

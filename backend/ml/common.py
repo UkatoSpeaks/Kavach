@@ -28,6 +28,12 @@ LOW_CONFIDENCE = DATASETS_DIR / "review_low_confidence.csv"
 # Synthetic "polished" scams and hard genuine messages (ml/evaluate.py --dataset polished).
 # Evaluation only: ml/train_classifier.py refuses to train if one of them is in train/val.
 POLISHED_EVAL = DATASETS_DIR / "polished_eval.csv"
+# Its two halves (ml/split_polished.py): develop on dev, look at test once, at the end.
+POLISHED_DEV = DATASETS_DIR / "polished_dev.csv"
+POLISHED_TEST = DATASETS_DIR / "polished_test.csv"
+# Polished scams and hard genuine messages for TRAINING, written separately from the
+# evaluation set (hand-written, Claude) and checked to be no near-duplicate of it.
+POLISHED_TRAIN = DATASETS_DIR / "polished_train.csv"
 # label_source: empty or "manual" = you; "assisted" = labelled by an AI assistant (Claude)
 # reading the row, not by you. label_reason / confidence: the labeller's note (optional).
 REVIEW_COLUMNS = ("id", "text", "auto_label", "auto_scam_type", "top_signals", "my_label",

@@ -1,7 +1,8 @@
 # Datasets
 
-Everything here except this README, `collected_template.csv` and `processed/.gitkeep` is
-gitignored. Scripts live in `backend/ml/`; run them from `backend/` with `uv run python -m ...`.
+Everything here except this README, `collected_template.csv`, the polished sets
+(`polished_*.csv`, `polished_eval_network.json`: synthetic, no personal data) and
+`processed/.gitkeep` is gitignored. Scripts live in `backend/ml/`; run them from `backend/` with `uv run python -m ...`.
 
 ```
 raw/                 public downloads            (ml/download_public.py)
@@ -34,6 +35,8 @@ uv run python -m ml.generate_synthetic --max-calls 60   # Groq free tier; resuma
 uv run python -m ml.prepare_dataset      # again, to add the synthetic rows to train
 uv run python -m ml.train_classifier     # TF-IDF + logistic regression -> models/classifier.json
 uv run python -m ml.eval_classifier      # held-out metrics + ablation -> ml/reports/private/
+uv run python -m ml.eval_corroboration   # threshold + corroboration trade-off, on val only
+uv run python -m ml.split_polished       # polished_eval.csv -> polished_dev / polished_test
 uv run python -m ml.disagreements        # rules vs classifier -> review_disagreements.csv
 uv run python -m ml.evaluate --dataset test     # the full pipeline: test | india | collected | uci | examples | val | a CSV
 ```
@@ -200,6 +203,47 @@ uv run python -m ml.evaluate --dataset polished --name polished_offline
 uv run python -m ml.evaluate --dataset polished --modes checks --name polished_mocknet --mock-network data/datasets/polished_eval_network.json
 ```
 
+### Dev and test halves (`polished_dev.csv`, `polished_test.csv`)
+
+`ml/split_polished.py` splits the 80 messages 50/50, stratified (scams by `scam_type`,
+genuine messages by `category`, since they have no scam_type), shuffled with the fixed seed
+`20261019`; when a stratum has an odd size its extra message alternates between the halves,
+so each has 20 scams and 20 genuine messages. Re-running it writes the same files (a test
+checks this). Fixes are developed against `--dataset polished_dev` only; `--dataset
+polished_test` was first looked at after the 2026-10-19 fixes were final, and is the number
+to report. `polished_eval.csv` stays the full set: the training leak checks read it.
+
+Split on 2026-10-19 (seed 20261019):
+
+| half | scams | genuine |
+|---|---|---|
+| dev | ps02 03 04 06 07 08 14 15 17 20 22 24 27 28 29 31 35 36 39 40 | pg01 03 06 07 09 11 12 15 16 21 24 26 27 29 31 32 34 36 37 38 |
+| test | ps01 05 09 10 11 12 13 16 18 19 21 23 25 26 30 32 33 34 37 38 | pg02 04 05 08 10 13 14 17 18 19 20 22 23 25 28 30 33 35 39 40 |
+
+**Caveat:** the rule fixes of 2026-10-19 come from a write-up
+(`ml/reports/2026-10-19_polished_summary.md`) that had read all 80 messages before the
+split, so the test half is held out for the retrained classifier and for the choice of
+settings, but not fully for the rule ideas.
+
+## Polished training set (`polished_train.csv`)
+
+**Synthetic, hand-written (Claude), training only.** 432 messages written on 2026-10-19 in
+the same clean style as the evaluation set but separately from it: 291 genuine hard negatives
+(bank alerts, KYC reminders pointing to the app, branch or the bank's own site, card-block
+and lock confirmations, delivery-OTP messages, customs and duty notices from real couriers,
+brand short links such as amzn.to, fkrt.it, zoma.to, swig.gy, hdfcbk.io, i.airtel.in, bills,
+refunds, recruiters, support replies) and 141 polished scams across the v1 types; 281
+English, 91 Hinglish, 60 Hindi. Columns `id, text, label, scam_type, category, language,
+source`. Scam domains are invented; phone numbers are 99999 numbers.
+
+No message may be a near-duplicate of an evaluation message: token Jaccard < 0.5 with every
+`polished_eval.csv` message, and < 0.6 on the classifier's masked tokens
+(`tests/test_polished_eval.py`). 15 of the 447 written first failed that check and were
+dropped (mostly short Hindi messages, whose shared function words alone reach 0.5).
+`ml/prepare_dataset.py` loads it with `synthetic/generated.csv` (train split only, group =
+its own id), and also drops any synthetic row with Jaccard ≥ 0.7 to a polished evaluation
+message.
+
 ## Unified schema (processed/*.csv)
 
 `id, text, label, original_label, scam_type, language, source, dataset, is_synthetic,
@@ -258,7 +302,8 @@ written by hand (Groq produced almost no Hinglish ones; source `hand-written (Cl
 160 scam variations of 40 parents, 497 genuine hard negatives (173 of them awareness
 advisories: 100 English, 47 Hindi, 26 Hinglish), 54 promotions. 688 are in train: the 8
 variations of your collected messages are dropped (their parents are test-only), plus
-duplicates.
+duplicates. Since 2026-10-19 the 432 messages of `polished_train.csv` (see above) join them:
+1,120 synthetic rows in train.
 
 ## The classifier (`ml/train_classifier.py`, `app/services/classifier.py`)
 
@@ -276,14 +321,19 @@ to run if one is in train/val, and `tests/test_classifier.py` fails if the model
 n-gram that only your messages have (it runs locally, where the data is).
 
 In scoring it is the `classifier` signal (weight in `SIGNAL_WEIGHTS`): score = 100·P(scam),
-counted only when P(scam) ≥ `CLASSIFIER_MIN_SCAM_PROBABILITY` (0.9), never a floor. 0.9 is
-the lowest threshold at which, on **val**, all 36 built-in examples keep their verdicts (at
-0.5-0.8 one genuine example still becomes suspicious). On a fraud-awareness notice
+counted only when P(scam) ≥ `CLASSIFIER_MIN_SCAM_PROBABILITY` (0.9), never a floor. 0.9 was
+the lowest threshold at which, on **val**, all 36 built-in examples kept their verdicts (at
+0.5-0.8 one genuine example still became suspicious). The 2026-10-19 model keeps them from
+0.6, but on val 0.6 flags 10/905 genuine messages instead of 5 (and 3/20 polished_dev instead
+of 1) for +6 of 156 Indian scams, so the threshold stayed 0.9 (`ml/eval_corroboration.py`).
+Optionally (`CLASSIFIER_REQUIRES_CORROBORATION`, off) it needs corroboration from another
+signal; on val that costs 59 of 156 Indian scams, see
+[docs/EVALUATION.md](../../../docs/EVALUATION.md#corroboration-the-trade-off). On a fraud-awareness notice
 (`rules.advisory_evidence`: "never asks", "do not share", "beware", "1930", Hindi/Hinglish
 forms, and no link, UPI ID, phone number, amount or request for money) its weight is
 multiplied by `CLASSIFIER_ADVISORY_WEIGHT_FACTOR` (0.5).
 
-### Results (held-out, 2026-09-29)
+### Results (held-out, 2026-10-19)
 
 Every message below is outside train and val, and so is every near-duplicate of it (template
 groups). Flagged = verdict suspicious or scam (rules, combined) or calibrated P(scam) ≥ 0.5
@@ -293,25 +343,37 @@ groups). Flagged = verdict suspicious or scam (rules, combined) or calibrated P(
 
 | | precision | scam recall | FPR (not scam) | FPR at 90% recall |
 |---|---:|---:|---:|---:|
-| rules only | 98.8% | 52.9% (45–61%) | 0.3% (0–2%) | unreachable* |
-| classifier only | 91.5% | 97.4% (94–99%) | 4.8% (3–8%) | 1.0% |
-| rules + classifier | 97.3% | **93.5%** (89–96%) | 1.4% (1–3%) | 1.4% |
+| rules only | 98.7% | 50.3% (43–58%) | 0.3% (0–2%) | unreachable* |
+| classifier only | 91.5% | 96.8% (93–99%) | 4.8% (3–8%) | 1.0% |
+| rules + classifier | 97.3% | **94.2%** (89–97%) | 1.4% (1–3%) | 1.4% |
 
 **False positives of the full pipeline (combined) on genuine messages:**
 
 | | rules only | rules + classifier |
 |---|---:|---:|
-| India ham (held-out) | 1/206 | 1/206 |
+| India ham (held-out) | 0/206 | 0/206 |
 | UCI ham (unseen) | 0/690 | 1/690 |
-| Mendeley ham (held-out) | 0/697 | 0/697 |
-| India promo (held-out) | 0/86 | 3/86 |
+| Mendeley ham (held-out) | 0/697 | 1/697 |
+| India promo (held-out) | 1/86 | 4/86 |
 
-**All held-out pooled** (2,688: India, Mendeley, non-Indian IMC25): scam recall 15.0% →
-86.5% combined, FPR 0.1% → 0.9%; classifier alone: AP 99.3%, FPR 1.2% at 90% recall.
+**All held-out pooled** (2,688: India, Mendeley, non-Indian IMC25): scam recall 15.6% →
+85.7% combined, FPR 0.1% → 1.1%; classifier alone: AP 99.2%, FPR 1.5% at 90% recall.
 
-**Per class (classifier alone), India held-out:** genuine P 98.1% / R 98.5%, promo_spam
-P 98.6% / R 84.9%, scam P 91.0% / R 97.4% (macro-F1 94.5%). Pooled: macro-F1 90.7%, promo
+**Per class (classifier alone), India held-out:** genuine P 97.6% / R 98.5%, promo_spam
+P 98.6% / R 84.9%, scam P 90.9% / R 96.8% (macro-F1 94.3%). Pooled: macro-F1 90.7%, promo
 recall only 75.4%.
+
+**What changed on 2026-10-19** (polished scams; details and the polished-set numbers in
+[docs/EVALUATION.md](../../../docs/EVALUATION.md#polished-scams-2026-10-19)). Retrained with the
+432 messages of `polished_train.csv`, on the same splits; rule and link-check fixes;
+FEATURES_VERSION 3 (new brands and bare `.gy`/`.to`/`.it` links change the link tokens).
+India held-out combined: recall 93.5% → 94.2% (+1 of 155), India ham false positives 1 → 0,
+promos 3 → 4 (a Refyne "complete KYC" promo now trips the new `account_action_link` rule;
+it also became `uncertain` for the auto-labeller, so the held-out file of 2026-09-29 was kept
+for this comparison), UCI unseen 1 → 1, Mendeley ham 0 → 1. Rules alone: 82 → 78 Indian
+scams, four IMC25 reports whose link the dataset removed ("click here link"): with no link,
+phone or UPI ID, `account_blocked` now weighs 0.2. Non-Indian IMC25 held-out recall
+86.4% → 85.3%.
 
 \* The rules score most messages 0; below that there is no threshold, so reaching 90%
 recall means flagging everything.

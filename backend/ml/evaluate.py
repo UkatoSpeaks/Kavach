@@ -26,7 +26,7 @@ public datasets' "spam"/"smishing" (NOT the same thing as our "scam"; see the re
     uv run python -m ml.evaluate --dataset collected --modes checks   # every message
     uv run python -m ml.evaluate --dataset test --modes rules,checks,llm --llm-limit 30
     uv run python -m ml.evaluate --dataset path/to/file.csv --name my_set   # text,label
-    uv run python -m ml.evaluate --dataset polished --name polished_offline
+    uv run python -m ml.evaluate --dataset polished_dev --name polished_dev_offline   # or polished
     uv run python -m ml.evaluate --dataset polished --modes checks --name polished_mocknet
         --mock-network data/datasets/polished_eval_network.json   # (one command)
 
@@ -63,7 +63,9 @@ from app.services.knowledge_base import load_docs
 from ml.autolabel import UNCERTAIN
 from ml.common import (
     OOD_LABELS,
+    POLISHED_DEV,
     POLISHED_EVAL,
+    POLISHED_TEST,
     PROCESSED_DIR,
     REPORTS_DIR,
     guess_language,
@@ -195,8 +197,13 @@ def test_split_notes() -> tuple[str, ...]:
 def load_eval_set(dataset: str) -> EvalSet:
     if dataset == "examples":
         return load_examples()
-    if dataset == "polished":  # synthetic: no personal data, the report can be shared
-        return load_csv_set(POLISHED_EVAL, "polished", POLISHED_CAVEAT)
+    dev = " This is the dev half (ml/split_polished.py): fixes were developed against it."
+    test = " This is the held-out test half (ml/split_polished.py): not used to develop fixes."
+    polished = {"polished": (POLISHED_EVAL, ""), "polished_dev": (POLISHED_DEV, dev),
+                "polished_test": (POLISHED_TEST, test)}  # fmt: skip
+    if dataset in polished:  # synthetic: no personal data, the report can be shared
+        path, half = polished[dataset]
+        return load_csv_set(path, dataset, POLISHED_CAVEAT + half)
     named = {
         "uci": ("ood_uci_sms_spam.csv", UCI_CAVEAT),
         "mendeley": ("ood_mendeley_sms_phishing.csv",
@@ -761,7 +768,8 @@ def main() -> None:
     parser.add_argument(
         "--dataset",
         default="examples",
-        help="examples | uci | mendeley | test | val | india | collected | polished | a CSV path",
+        help="examples | uci | mendeley | test | val | india | collected | polished | "
+        "polished_dev | polished_test | a CSV path",
     )
     parser.add_argument("--name", help="report name (default: the dataset name)")
     parser.add_argument("--modes", default="rules,checks", help=f"comma-separated: {MODES}")

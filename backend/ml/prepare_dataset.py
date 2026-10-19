@@ -15,7 +15,9 @@ Sources
   scam / uncertain (label_source "auto") unless it was reviewed (reviewed_labels.csv:
   label_source "manual" if you labelled it, "assisted" if an AI assistant did).
 - data/datasets/collected/*.csv (your messages; columns as in collected_template.csv)
-- data/datasets/synthetic/generated.csv (ml/generate_synthetic.py; train split only)
+- data/datasets/synthetic/generated.csv (ml/generate_synthetic.py) and
+  data/datasets/polished_train.csv (hand-written polished messages): train split only, and
+  never close to a val/test/held-out or polished evaluation message
 
 Outputs in data/datasets/processed/ (columns: ml.common.COLUMNS)
 - ood_<dataset>.csv: the public non-Indian datasets. OUT-OF-DOMAIN evaluation only, never
@@ -67,6 +69,8 @@ from ml.common import (
     COLLECTED_DIR,
     COLUMNS,
     LABELS,
+    POLISHED_EVAL,
+    POLISHED_TRAIN,
     PROCESSED_DIR,
     RAW_DIR,
     REVIEW_COLUMNS,
@@ -317,11 +321,9 @@ def load_collected(directory: Path = COLLECTED_DIR) -> tuple[list[Row], list[str
     return rows, problems
 
 
-def load_synthetic(path: Path = SYNTHETIC_FILE) -> list[Row]:
-    if not path.exists():
-        return []
+def load_synthetic(paths: Iterable[Path] = (SYNTHETIC_FILE, POLISHED_TRAIN)) -> list[Row]:
     rows = []
-    for r in read_csv(path):
+    for r in (r for path in paths if path.exists() for r in read_csv(path)):
         if not (r.get("text") or "").strip() or r.get("label") not in LABELS:
             continue
         rows.append(_row(
@@ -745,6 +747,12 @@ def main() -> None:
     synthetic, _ = dedupe(load_synthetic(), args.near_dup)
     real_ids = {r["id"] for r in everything}
     synthetic = [s for s in synthetic if s["id"] not in real_ids]
+    # The polished evaluation set is test-only: no synthetic row may paraphrase it.
+    polished = [_row(r["text"]) for r in read_csv(POLISHED_EVAL)] if POLISHED_EVAL.exists() else []
+    close = _close_to_any(synthetic, polished, SYNTHETIC_LEAK)
+    if close:
+        print(f"synthetic: {len(close)} dropped (too close to a polished evaluation message)")
+    synthetic = [s for k, s in enumerate(synthetic) if k not in close]
 
     # UCI joins the grouping (not the splits) to find its rows that no model has seen.
     print(f"grouping {len(real) + len(uci)} messages into templates...", flush=True)
