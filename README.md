@@ -7,7 +7,7 @@
 ![Next.js](https://img.shields.io/badge/Next.js-16-000000?logo=nextdotjs&logoColor=white)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-**[Live demo](https://kavach-mu-blush.vercel.app)** · **[API health](https://kavach-api-mib4.onrender.com/health)**
+**[Live demo](https://kavach-scan.vercel.app)** · **[API health](https://kavach-api-mib4.onrender.com/health)**
 
 > The API runs on Render's free tier and sleeps when idle, so the first request may take **~50 seconds** to wake it. After that it's fast.
 
