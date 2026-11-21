@@ -197,6 +197,20 @@ class Settings(BaseSettings):
     HTTP_TIMEOUT_S: float = 5.0
     URL_CACHE_TTL_HOURS: int = 24
 
+    # Scan cache (app/services/scan_cache.py): whole analysis results keyed on the normalized
+    # input, so a repeated scan skips Groq. L1: in-process LRU; L2: the scan_cache table.
+    # Only results with a successful LLM step are cached.
+    SCAN_CACHE_ENABLED: bool = True
+    SCAN_CACHE_L1_SIZE: int = 1000
+    SCAN_CACHE_L1_TTL_S: int = 3600
+    SCAN_CACHE_TTL_UPI_HOURS: float = 24
+    SCAN_CACHE_TTL_URL_HOURS: float = 12
+    SCAN_CACHE_TTL_MESSAGE_HOURS: float = 7 * 24
+    SCAN_CACHE_TTL_IMAGE_HOURS: float = 7 * 24  # screenshots and QR images
+    # Groq 429: wait this long (or the Retry-After it sends, capped at the max) and retry once.
+    GROQ_RATE_LIMIT_BACKOFF_S: float = 1.0
+    GROQ_RATE_LIMIT_BACKOFF_MAX_S: float = 3.0
+
     # Scoring. Relative weight of each signal in the final score; signals that are missing
     # for a request are skipped and the remaining weights renormalize to 1. Override in
     # .env as JSON, e.g. SIGNAL_WEIGHTS='{"rules": 0.5, "classifier": 0.5}'.

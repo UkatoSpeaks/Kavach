@@ -16,7 +16,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.config import get_settings
@@ -164,3 +164,25 @@ class UrlCache(Base):
     url: Mapped[str] = mapped_column(Text, primary_key=True)
     result: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     checked_at: Mapped[datetime] = _now()
+
+
+class ScanCache(Base):
+    """L2 of the scan cache (app/services/scan_cache.py)."""
+
+    __tablename__ = "scan_cache"
+    __table_args__ = (
+        Index("ix_scan_cache_expires_at", "expires_at"),
+        Index("ix_scan_cache_entity_tags", "entity_tags", postgresql_using="gin"),
+    )
+
+    cache_key: Mapped[str] = mapped_column(Text, primary_key=True)  # e.g. "upi:<sha256>"
+    scan_type: Mapped[str] = mapped_column(Text, nullable=False)
+    result: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = _now()
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    hit_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # scan_cache.entity_tag() of every reportable entity the result was checked against:
+    # a new report on any of them deletes the row (ScanCache.invalidate).
+    entity_tags: Mapped[list[str]] = mapped_column(
+        ARRAY(Text), nullable=False, server_default=text("'{}'")
+    )

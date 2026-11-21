@@ -33,7 +33,7 @@ import groq
 from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
-from app.services.agent.llm import describe_error
+from app.services.agent.llm import describe_error, rate_limit_delay
 from app.services.screenshot import AppKind, guess_fields
 
 logger = logging.getLogger(__name__)
@@ -156,6 +156,7 @@ class OCRResult:
     language: str | None = None
     notes: tuple[str, ...] = ()  # why an engine was skipped or failed
     latency_ms: dict[str, float] = field(default_factory=dict)
+    rate_limited: bool = False  # Groq vision answered 429 (after its retry)
 
 
 class InvalidVisionOutput(ValueError):
@@ -221,7 +222,12 @@ def parse_vision_reply(raw: str) -> tuple[VisionReply, tuple[str, ...]]:
 
 
 class VisionFailed(Exception):
-    """`str(exc)` is a short note for the breakdown ("rate limited (429)")."""
+    """`str(exc)` is a short note for the breakdown ("rate limited (429)"). `rate_limit` is
+    the 429 behind it, if that was the reason."""
+
+    def __init__(self, note: str, rate_limit: groq.RateLimitError | None = None) -> None:
+        super().__init__(note)
+        self.rate_limit = rate_limit
 
 
 class VisionReader(Protocol):
@@ -278,8 +284,9 @@ class GroqVisionOCR:
         except groq.APIStatusError as exc:
             if exc.status_code == 400 and "json_validate_failed" in str(exc.body or exc):
                 raise VisionFailed("invalid output (json_validate_failed)") from exc
-            kind = "rate limited" if isinstance(exc, groq.RateLimitError) else "error"
-            raise VisionFailed(f"{kind} ({exc.status_code})") from exc
+            if isinstance(exc, groq.RateLimitError):
+                raise VisionFailed(f"rate limited ({exc.status_code})", exc) from exc
+            raise VisionFailed(f"error ({exc.status_code})") from exc
         except groq.APIError as exc:
             err = describe_error(exc, secrets=[self.api_key])
             raise VisionFailed(f"{type(exc).__name__} ({err.root_class})") from exc
@@ -468,28 +475,53 @@ class RapidLocalOCR:
 
 
 class ScreenshotReader:
-    """Vision first, local OCR second. Never raises: engine "none" if neither read it."""
+    """Vision first, local OCR second. Never raises: engine "none" if neither read it.
+
+    A 429 from vision is retried once after a backoff, but only without a local OCR: with
+    one, reading locally is faster than waiting."""
 
     def __init__(
         self,
         vision: VisionReader | None,
         local: LocalReader | None,
         local_timeout_s: float = LOCAL_TIMEOUT_S,
+        rate_limit_backoff_s: float = 1.0,
+        rate_limit_backoff_max_s: float = 3.0,
     ) -> None:
         self.vision = vision
         self.local = local
         self.local_timeout_s = local_timeout_s
+        self.rate_limit_backoff_s = rate_limit_backoff_s
+        self.rate_limit_backoff_max_s = rate_limit_backoff_max_s
+
+    async def _read_vision(
+        self, vision: VisionReader, image: PreparedImage, notes: list[str]
+    ) -> tuple[VisionReply, tuple[str, ...]]:
+        try:
+            return await vision.read(image)
+        except VisionFailed as exc:
+            if exc.rate_limit is None or self.local is not None:
+                raise
+            notes.append(f"groq_vision ({vision.model}): {exc}, retrying")
+            await asyncio.sleep(
+                rate_limit_delay(
+                    exc.rate_limit, self.rate_limit_backoff_s, self.rate_limit_backoff_max_s
+                )
+            )
+            return await vision.read(image)
 
     async def read(self, image: PreparedImage) -> OCRResult:
         notes: list[str] = []
         latency: dict[str, float] = {}
+        rate_limited = False
         if self.vision is None:
             notes.append("groq_vision: not configured")
         else:
             start = time.perf_counter()
             try:
-                reply, reply_notes = await self.vision.read(image)
+                reply, reply_notes = await self._read_vision(self.vision, image, notes)
             except VisionFailed as exc:
+                rate_limited = exc.rate_limit is not None
                 notes.append(f"groq_vision ({self.vision.model}): {exc}")
                 logger.warning("vision OCR failed, trying local OCR: %s", exc)
             except Exception as exc:  # fail soft: a bug must not cost the analysis
@@ -506,7 +538,9 @@ class ScreenshotReader:
                 notes.append("groq_vision: no text found")
         if self.local is None:
             notes.append("local: disabled (LOCAL_OCR_ENABLED=false)")
-            return OCRResult("", "none", notes=tuple(notes), latency_ms=latency)
+            return OCRResult(
+                "", "none", notes=tuple(notes), latency_ms=latency, rate_limited=rate_limited
+            )
         start = time.perf_counter()
         try:
             async with asyncio.timeout(self.local_timeout_s):

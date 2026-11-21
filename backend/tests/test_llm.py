@@ -83,6 +83,7 @@ def error(status: int, code: str = "error") -> httpx.Response:
 
 
 def reasoner(**kw: Any) -> GroqReasoner:
+    kw.setdefault("rate_limit_backoff_s", 0)
     return GroqReasoner("test-key", PRIMARY, FALLBACK, timeout_s=8, **kw)
 
 

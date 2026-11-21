@@ -28,6 +28,7 @@ from app.services.agent.llm import Reasoner
 from app.services.cache import LookupCache
 from app.services.ocr import ScreenshotReader
 from app.services.pipeline import Checks
+from app.services.scan_cache import ScanCache
 from tests.fakes import FakeSession, InMemoryReputation, fake_pattern_search, session_factory
 
 # What every hostname resolves to unless a test says otherwise (see fake_dns).
@@ -100,16 +101,19 @@ def make_client(fake_session: FakeSession, reputation_store: InMemoryReputation)
     a test passes reasoner=, e.g. a tests.fakes.FakeReasoner; the real Groq API is never
     called here. Screenshots are read by `ocr=` (a ScreenshotReader with scripted Groq
     vision and/or tests.fakes.FakeLocalOCR); without it /analyze/screenshot returns 503.
+    The scan cache is off unless a test passes scan_cache= (e.g. ScanCache(None, settings)).
     Outbound HTTP is not mocked here; tests wrap calls in respx.mock.
     """
 
     def build(
         reasoner: Reasoner | None = None,
         ocr: ScreenshotReader | None = None,
+        scan_cache: ScanCache | None = None,
         **settings_overrides: Any,
     ) -> httpx.AsyncClient:
         settings = settings_for_tests(**settings_overrides)
         app = create_app(settings)
+        app.state.scan_cache = scan_cache
         patterns = fake_pattern_search()
         app.dependency_overrides[get_reasoner] = lambda: reasoner
         app.dependency_overrides[get_ocr_reader] = lambda: ocr

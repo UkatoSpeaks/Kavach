@@ -70,6 +70,11 @@ class AnalysisResult(BaseModel):
         default_factory=list,
         description="UPI IDs, phone numbers and link domains found in the input, for POST /report.",
     )
+    cached: bool = Field(
+        default=False,
+        description="True: the same input was analyzed recently and this result was reused "
+        "from the scan cache (no new Groq call).",
+    )
 
 
 class ScreenshotAnalysisResult(AnalysisResult):

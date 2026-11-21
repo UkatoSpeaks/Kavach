@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -23,6 +24,7 @@ from app.services.agent.llm import GroqReasoner, LRUTTLCache
 from app.services.classifier import get_classifier
 from app.services.embeddings import FastEmbedder
 from app.services.ocr import GroqVisionOCR, RapidLocalOCR, ScreenshotReader
+from app.services.scan_cache import ScanCache, purge_expired
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.engine = engine
     app.state.sessionmaker = create_sessionmaker(engine)
     app.state.http_client = new_http_client(settings.HTTP_TIMEOUT_S)
+    # Repeated scans skip Groq. Expired L2 rows are purged in the background at startup.
+    app.state.scan_cache = (
+        ScanCache(app.state.sessionmaker, settings) if settings.SCAN_CACHE_ENABLED else None
+    )
+    cleanup = (
+        asyncio.create_task(purge_expired(app.state.sessionmaker))
+        if settings.SCAN_CACHE_ENABLED
+        else None
+    )
     # Loads in a worker thread; until it's ready the pattern signal reports "unavailable".
     # Off (PATTERN_SIGNAL_ENABLED=false): fastembed is never imported, saving ~560 MB.
     app.state.embedder = None
@@ -57,6 +68,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             timeout_s=settings.LLM_TIMEOUT_S,
             reasoning_effort=settings.GROQ_REASONING_EFFORT,
             cache=LRUTTLCache(settings.LLM_CACHE_SIZE, settings.LLM_CACHE_TTL_S),
+            rate_limit_backoff_s=settings.GROQ_RATE_LIMIT_BACKOFF_S,
+            rate_limit_backoff_max_s=settings.GROQ_RATE_LIMIT_BACKOFF_MAX_S,
         )
         if settings.GROQ_API_KEY
         else None
@@ -76,6 +89,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         if settings.LOCAL_OCR_ENABLED
         else None,
+        rate_limit_backoff_s=settings.GROQ_RATE_LIMIT_BACKOFF_S,
+        rate_limit_backoff_max_s=settings.GROQ_RATE_LIMIT_BACKOFF_MAX_S,
     )
     logger.info(
         "startup complete",
@@ -93,6 +108,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        if cleanup is not None and not cleanup.done():
+            cleanup.cancel()
         await app.state.http_client.aclose()
         await engine.dispose()
         logger.info("shutdown complete")

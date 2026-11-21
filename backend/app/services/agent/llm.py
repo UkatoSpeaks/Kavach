@@ -5,7 +5,9 @@ Call policy (at most two calls per analysis, each with an LLM_TIMEOUT_S timeout)
 - Invalid output (bad JSON, schema errors, invented contact details, or Groq's own
   json_validate_failed): retry once with the same model. If explanation_hi altered an
   identifier from the message (a transliterated UPI ID, say), the retry adds a reminder.
-- Rate limit (429) or any other API error: retry once with GROQ_FALLBACK_MODEL.
+- Rate limit (429): wait (Retry-After, capped; see rate_limit_delay), then retry once with
+  GROQ_FALLBACK_MODEL.
+- Any other API error: retry once with GROQ_FALLBACK_MODEL.
 - Timeout: no retry; a second slow call would double the wait.
 - Anything left over: no assessment, and the caller uses the template explanations.
 
@@ -385,6 +387,16 @@ class Reasoner(Protocol):
     async def reason(self, evidence: Evidence) -> ReasonResult: ...
 
 
+def rate_limit_delay(exc: groq.APIStatusError, default_s: float, max_s: float) -> float:
+    """Seconds to wait before retrying a 429: Groq's Retry-After if it sent a usable one,
+    else default_s; never more than max_s. Pure."""
+    try:
+        retry_after = float(exc.response.headers.get("retry-after", ""))
+    except (ValueError, AttributeError):
+        retry_after = default_s
+    return max(0.0, min(retry_after, max_s))
+
+
 def _is_json_mode_failure(exc: groq.APIStatusError) -> bool:
     return exc.status_code == 400 and "json_validate_failed" in str(exc.body or exc)
 
@@ -399,6 +411,8 @@ class GroqReasoner:
     cache: LRUTTLCache[ReasonResult] = field(default_factory=lambda: LRUTTLCache(500, 3600))
     client: groq.AsyncGroq | None = None
     base_url: str | None = None  # None: the SDK's default (or GROQ_BASE_URL from the env)
+    rate_limit_backoff_s: float = 1.0  # wait before the retry after a 429 (see rate_limit_delay)
+    rate_limit_backoff_max_s: float = 3.0
 
     def __post_init__(self) -> None:
         if self.client is None:
@@ -473,7 +487,7 @@ class GroqReasoner:
         model = self.model
         notes: list[str] = []
         errors: list[str] = []  # full sanitized cause chains of network errors, for the log
-        for _ in range(2):
+        for attempt in range(2):
             try:
                 raw = await self._complete(model, messages)
                 return ReasonResult(parse_assessment(raw, evidence), model, tuple(notes))
@@ -495,8 +509,15 @@ class GroqReasoner:
                 if _is_json_mode_failure(exc):
                     notes.append(f"{model}: invalid output (json_validate_failed)")
                     continue
-                kind = "rate limited" if isinstance(exc, groq.RateLimitError) else "error"
+                rate_limited = isinstance(exc, groq.RateLimitError)
+                kind = "rate limited" if rate_limited else "error"
                 notes.append(f"{model}: {kind} ({exc.status_code})")
+                if rate_limited and attempt == 0:  # a retry follows
+                    await asyncio.sleep(
+                        rate_limit_delay(
+                            exc, self.rate_limit_backoff_s, self.rate_limit_backoff_max_s
+                        )
+                    )
                 model = self.fallback_model
             except groq.APIError as exc:
                 err = self.describe(exc)
